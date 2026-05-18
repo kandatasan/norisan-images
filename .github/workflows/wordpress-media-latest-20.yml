@@ -14,6 +14,15 @@ on:
           - '1300'
           - '2000'
           - all
+      ai_image_limit:
+        description: 'Number of unknown thumbnail images to classify with OpenAI vision. Use 0 to disable.'
+        required: false
+        default: '50'
+        type: choice
+        options:
+          - '0'
+          - '50'
+          - '100'
 
 permissions:
   contents: read
@@ -26,8 +35,11 @@ jobs:
       WP_URL: ${{ secrets.WP_URL }}
       WP_USER: ${{ secrets.WP_USER }}
       WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-5-mini' }}
       OUTPUT_DIR: wp-media-test-output
       MEDIA_LIMIT: ${{ inputs.media_limit || '300' }}
+      AI_IMAGE_LIMIT: ${{ inputs.ai_image_limit || '50' }}
 
     steps:
       - name: Checkout repository
@@ -38,28 +50,34 @@ jobs:
         with:
           python-version: '3.x'
 
-      - name: Validate required secrets
+      - name: Validate required secrets and inputs
         shell: bash
         run: |
           set -euo pipefail
           echo "::add-mask::${WP_APP_PASSWORD}"
-          missing=0
-          for name in WP_URL WP_USER WP_APP_PASSWORD; do
-            if [ -z "${!name}" ]; then
-              echo "::error title=Missing secret::GitHub Secret ${name} is required for this manual workflow."
-              missing=1
-            fi
-          done
-          case "${MEDIA_LIMIT}" in
-            300|800|1300|2000|all) ;;
-            *)
-              echo "::error title=Invalid media_limit::media_limit must be one of: 300, 800, 1300, 2000, all."
-              missing=1
-              ;;
-          esac
-          if [ "${missing}" -ne 0 ]; then
-            exit 2
-          fi
+          python3 - <<'PY'
+          import os
+          import sys
+
+          missing = False
+          for name in ("WP_URL", "WP_USER", "WP_APP_PASSWORD"):
+              if not os.environ.get(name):
+                  print(f"::error title=Missing secret::GitHub Secret {name} is required for this manual workflow.")
+                  missing = True
+
+          media_limit = os.environ.get("MEDIA_LIMIT", "300")
+          if media_limit not in {"300", "800", "1300", "2000", "all"}:
+              print("::error title=Invalid media_limit::media_limit must be one of: 300, 800, 1300, 2000, all.")
+              missing = True
+
+          ai_image_limit = os.environ.get("AI_IMAGE_LIMIT", "50")
+          if ai_image_limit not in {"0", "50", "100"}:
+              print("::error title=Invalid ai_image_limit::ai_image_limit must be one of: 0, 50, 100.")
+              missing = True
+
+          if missing:
+              sys.exit(2)
+          PY
 
       - name: Run latest media GET export
         id: export
@@ -69,7 +87,11 @@ jobs:
           echo "::add-mask::${WP_APP_PASSWORD}"
           mkdir -p "${OUTPUT_DIR}"
 
-          python3 scripts/organize_wp_media.py --output-dir "${OUTPUT_DIR}" --latest-20 --limit "${MEDIA_LIMIT}" --skip-posts --timeout 30 --retries 1 > "${OUTPUT_DIR}/run.stdout.log" 2> "${OUTPUT_DIR}/run.stderr.log"
+          ai_args=()
+          if [ "${AI_IMAGE_LIMIT}" != "0" ]; then
+            ai_args=(--ai-classify --ai-limit "${AI_IMAGE_LIMIT}" --ai-model "${OPENAI_MODEL}")
+          fi
+          python3 scripts/organize_wp_media.py --output-dir "${OUTPUT_DIR}" --latest-20 --limit "${MEDIA_LIMIT}" --skip-posts --timeout 30 --retries 1 "${ai_args[@]}" > "${OUTPUT_DIR}/run.stdout.log" 2> "${OUTPUT_DIR}/run.stderr.log"
           status=$?
 
           if [ -s "${OUTPUT_DIR}/run.stdout.log" ]; then
@@ -106,6 +128,7 @@ jobs:
           output = Path("wp-media-test-output")
           index_path = output / "image-index.csv"
           groups_path = output / "image-groups.csv"
+          ai_log_path = output / "ai-category-log.csv"
           run_log_path = output / "media-organizer-run-log.csv"
           summary_path = output / "media-organizer-summary.json"
 
@@ -113,6 +136,8 @@ jobs:
               raise SystemExit("image-index.csv was not generated")
           if not groups_path.exists():
               raise SystemExit("image-groups.csv was not generated")
+          if not ai_log_path.exists():
+              raise SystemExit("ai-category-log.csv was not generated")
           if not run_log_path.exists():
               raise SystemExit("media-organizer-run-log.csv was not generated")
           if not summary_path.exists():
@@ -132,7 +157,7 @@ jobs:
               if len(rows) > media_limit:
                   raise SystemExit(f"Expected at most {media_limit} media rows, got {len(rows)}")
 
-          required_columns = ["filename", "title", "alt", "category", "possible_article", "upload_date", "image_url", "local_path"]
+          required_columns = ["filename", "title", "alt", "category", "ai_category", "ai_reason", "possible_article", "upload_date", "image_url", "local_path"]
           if fieldnames != required_columns:
               raise SystemExit(f"Unexpected image-index.csv columns: {fieldnames}")
 
@@ -158,6 +183,13 @@ jobs:
                       raise SystemExit(f"Expected media query {key}={value}, got {actual}")
 
           summary = json.loads(summary_path.read_text(encoding="utf-8"))
+          expected_ai_enabled = os.environ["AI_IMAGE_LIMIT"] != "0"
+          if summary.get("ai_classification_enabled") != expected_ai_enabled:
+              raise SystemExit(f"Summary ai_classification_enabled {summary.get('ai_classification_enabled')} does not match expected {expected_ai_enabled}")
+          if summary.get("ai_limit") != (int(os.environ["AI_IMAGE_LIMIT"]) if expected_ai_enabled else 0):
+              raise SystemExit(f"Summary ai_limit {summary.get('ai_limit')} does not match input {os.environ['AI_IMAGE_LIMIT']}")
+          if summary.get("ai_reclassified_count", 0) > summary.get("ai_classified_count", 0):
+              raise SystemExit("ai_reclassified_count must be <= ai_classified_count")
           if summary.get("requested_limit") != expected_requested_limit:
               raise SystemExit(f"Summary requested_limit {summary.get('requested_limit')} does not match input {expected_requested_limit}")
           if summary.get("fetched_count") != len(rows):
@@ -180,6 +212,18 @@ jobs:
           if methods_used - {"GET"}:
               raise SystemExit(f"Forbidden methods in summary: {sorted(methods_used - {'GET'})}")
 
+          with ai_log_path.open(newline="", encoding="utf-8") as file_obj:
+              ai_log_reader = csv.DictReader(file_obj)
+              ai_log_rows = list(ai_log_reader)
+              ai_log_fieldnames = ai_log_reader.fieldnames or []
+          required_ai_log_columns = ["filename", "local_path", "text_category", "ai_category", "final_category", "ai_status", "ai_reason"]
+          if ai_log_fieldnames != required_ai_log_columns:
+              raise SystemExit(f"Unexpected ai-category-log.csv columns: {ai_log_fieldnames}")
+          if expected_ai_enabled and len(ai_log_rows) != len(rows):
+              raise SystemExit(f"Expected AI log rows to match image rows when enabled: {len(ai_log_rows)} != {len(rows)}")
+          if not expected_ai_enabled and ai_log_rows:
+              raise SystemExit("AI log rows should be empty when AI classification is disabled")
+
           with groups_path.open(newline="", encoding="utf-8") as file_obj:
               group_reader = csv.DictReader(file_obj)
               group_rows = list(group_reader)
@@ -190,7 +234,7 @@ jobs:
           if summary.get("group_count") != len(group_rows):
               raise SystemExit(f"Summary group_count {summary.get('group_count')} does not match group CSV rows {len(group_rows)}")
 
-          print(f"OK: requested_limit={expected_requested_limit}, image-index.csv rows={len(rows)}, thumbnails={summary.get('thumbnail_saved_count')}, thumbnail_errors={summary.get('thumbnail_error_count')}, image-groups.csv rows={len(group_rows)}, WordPress methods={sorted(methods) or ['GET']}, paginated query verified")
+          print(f"OK: requested_limit={expected_requested_limit}, image-index.csv rows={len(rows)}, thumbnails={summary.get('thumbnail_saved_count')}, thumbnail_errors={summary.get('thumbnail_error_count')}, ai_enabled={summary.get('ai_classification_enabled')}, ai_reclassified={summary.get('ai_reclassified_count')}, image-groups.csv rows={len(group_rows)}, WordPress methods={sorted(methods) or ['GET']}, paginated query verified")
           PY
 
       - name: Write AI inference report
@@ -214,9 +258,11 @@ jobs:
           summary = json.loads(summary_path.read_text(encoding="utf-8"))
           categories = Counter(row["category"] for row in rows)
           priority_categories = [
-              "muv/tunnel", "muv/food", "muv/exterior", "muv/map",
-              "lexus/koukai", "lexus/luggage", "lexus/visibility", "lexus/interior",
-              "tsurikue/fishing", "tsurikue/food", "tsurikue/gear", "tsurikue/spot",
+              "car/lexus", "car/tanto",
+              "genre/fishing", "genre/leisure", "genre/travel", "genre/gourmet",
+              "location/hiroshima", "location/shimane", "location/tottori",
+              "location/yamaguchi", "location/fukuoka", "location/oita", "location/awaji",
+              "bird", "aquarium",
           ]
 
           lines = [
@@ -230,18 +276,23 @@ jobs:
               f"- 類似画像グループ数: {summary.get('group_count')} 件",
               f"- サムネイル保存件数: {summary.get('thumbnail_saved_count', 0)} 件",
               f"- サムネイル取得失敗件数: {summary.get('thumbnail_error_count', 0)} 件",
+              f"- AI画像分類: {'有効' if summary.get('ai_classification_enabled') else '無効'}",
+              f"- AI分類対象上限: {summary.get('ai_limit', 0)} 件",
+              f"- AI分類試行件数: {summary.get('ai_classified_count', 0)} 件",
+              f"- AIでunknownから分類できた件数: {summary.get('ai_reclassified_count', 0)} 件",
+              f"- AI分類エラー件数: {summary.get('ai_error_count', 0)} 件",
               "",
               "## 2. image-index.csv サンプル5件",
               "",
-              "| filename | title | category | possible_article | upload_date |",
-              "| --- | --- | --- | --- | --- |",
+              "| filename | title | category | ai_category | possible_article | upload_date |",
+              "| --- | --- | --- | --- | --- | --- |",
           ]
           for row in rows[:5]:
-              values = [row["filename"], row["title"], row["category"], row["possible_article"], row["upload_date"]]
+              values = [row["filename"], row["title"], row["category"], row.get("ai_category", ""), row["possible_article"], row["upload_date"]]
               escaped = [value.replace("|", "\\|").replace("\n", " ") for value in values]
               lines.append("| " + " | ".join(escaped) + " |")
           if not rows:
-              lines.append("| （該当なし） |  |  |  |  |")
+              lines.append("| （該当なし） |  |  |  |  |  |")
 
           lines.extend(["", "## 3. 推測カテゴリ一覧"])
           if categories:
@@ -254,7 +305,23 @@ jobs:
           for category in priority_categories:
               lines.append(f"- `{category}`: {categories.get(category, 0)} 件")
 
-          lines.extend(["", "## 4. possible_article サンプル"])
+          lines.extend(["", "## 4. AI画像分類ログ サンプル"])
+          ai_log_path = output / "ai-category-log.csv"
+          if ai_log_path.exists():
+              with ai_log_path.open(newline="", encoding="utf-8") as file_obj:
+                  ai_rows = list(csv.DictReader(file_obj))
+              if ai_rows:
+                  lines.extend(["", "| filename | text_category | ai_category | final_category | status | reason |", "| --- | --- | --- | --- | --- | --- |"])
+                  for row in ai_rows[:10]:
+                      values = [row["filename"], row["text_category"], row["ai_category"], row["final_category"], row["ai_status"], row["ai_reason"]]
+                      escaped = [value.replace("|", "\\|").replace("\n", " ") for value in values]
+                      lines.append("| " + " | ".join(escaped) + " |")
+              else:
+                  lines.append("- AI分類ログなし（AI分類無効または対象なし）")
+          else:
+              lines.append("- ai-category-log.csv がありません")
+
+          lines.extend(["", "## 5. possible_article サンプル"])
           for row in rows[:5]:
               lines.append(f"- {row['filename']}: {row['possible_article']}")
           if not rows:
@@ -262,7 +329,7 @@ jobs:
 
           lines.extend([
               "",
-              "## 5. 次段階の提案",
+              "## 6. 次段階の提案",
               "- CSVを確認し、`unknown` または意図と違うカテゴリのキーワードを追加する。",
               "- 保存済みの `thumbnails/` を確認し、分類キーワードや重複ハッシュ検出を調整する。",
               "- 記事テーマ別に `possible_article` の候補名を調整し、将来の『記事テーマ → 関連画像候補』表示に使える辞書を育てる。",
@@ -272,7 +339,7 @@ jobs:
               "- エラーログ品質: 失敗時は `run.stderr.log` と `media-organizer-summary.json` を artifact に残します。",
               "",
               "## 安全確認",
-              "- この workflow は GET のみを許可し、検証ステップで POST/PUT/DELETE が run log に含まれていないことを確認しています。",
+              "- WordPress REST API とサムネイル取得は GET のみを許可し、検証ステップで POST/PUT/DELETE が run log に含まれていないことを確認しています。AI分類が有効な場合は保存済みサムネイルのみをOpenAI Responses APIへ送ります。",
               "- WordPress投稿、メディア削除、既存記事変更は実行しません。",
           ])
 
@@ -305,25 +372,32 @@ jobs:
               "## 2. image-index.csv サンプル5件",
               "## 3. 推測カテゴリ一覧",
               "### 優先カテゴリ別ヒット状況",
-              "## 4. possible_article サンプル",
-              "## 5. 次段階の提案",
+              "## 4. AI画像分類ログ サンプル",
+              "## 5. possible_article サンプル",
+              "## 6. 次段階の提案",
               "リクエスト件数",
               "Summary fetched_count",
               "サムネイル保存件数",
               "サムネイル取得失敗件数",
+              "AI画像分類",
+              "AI分類試行件数",
+              "AIでunknownから分類できた件数",
               "## 安全確認",
-              "muv/tunnel",
-              "muv/food",
-              "muv/exterior",
-              "muv/map",
-              "lexus/koukai",
-              "lexus/luggage",
-              "lexus/visibility",
-              "lexus/interior",
-              "tsurikue/fishing",
-              "tsurikue/food",
-              "tsurikue/gear",
-              "tsurikue/spot",
+              "car/lexus",
+              "car/tanto",
+              "genre/fishing",
+              "genre/leisure",
+              "genre/travel",
+              "genre/gourmet",
+              "location/hiroshima",
+              "location/shimane",
+              "location/tottori",
+              "location/yamaguchi",
+              "location/fukuoka",
+              "location/oita",
+              "location/awaji",
+              "bird",
+              "aquarium",
               "POST/PUT/DELETE",
               "WordPress投稿、メディア削除、既存記事変更は実行しません",
           ]
@@ -376,7 +450,7 @@ jobs:
               "",
               "## 安全確認",
               "",
-              "この workflow は `scripts/organize_wp_media.py --latest-20 --limit <media_limit> --skip-posts` だけを実行します。投稿作成、記事更新、メディア削除、POST/PUT/DELETE は行いません。",
+              "この workflow は `scripts/organize_wp_media.py --latest-20 --limit <media_limit> --skip-posts` を実行し、AI分類が有効な場合のみ保存済みサムネイルをOpenAIへ送ります。WordPressへの投稿作成、記事更新、メディア削除、POST/PUT/DELETE は行いません。",
               "",
               "## media-organizer-summary.json",
               "",
@@ -417,6 +491,7 @@ jobs:
             ${{ env.OUTPUT_DIR }}/image-groups.csv
             ${{ env.OUTPUT_DIR }}/media-organizer-summary.json
             ${{ env.OUTPUT_DIR }}/media-organizer-run-log.csv
+            ${{ env.OUTPUT_DIR }}/ai-category-log.csv
             ${{ env.OUTPUT_DIR }}/ai-inference-report.md
             ${{ env.OUTPUT_DIR }}/thumbnails/**
             ${{ env.OUTPUT_DIR }}/failure-diagnosis.md
