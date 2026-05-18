@@ -9,7 +9,7 @@ import re
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import unquote, urlencode, urlparse
+from urllib.parse import quote, unquote, urlencode, urlparse, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 MAX_REST_PER_PAGE = 100
@@ -56,10 +56,36 @@ def get_preferred_image_url(item):
     return item.get("source_url", "")
 
 
+def safe_url_for_request(url):
+    parts = urlsplit(url)
+    path = quote(parts.path, safe="/%")
+    query = quote(parts.query, safe="=&%/:;+,@?")
+    fragment = quote(parts.fragment, safe="=&%/:;+,@?")
+
+    netloc = parts.netloc
+    if parts.hostname:
+        host = parts.hostname.encode("idna").decode("ascii")
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+
+        auth = ""
+        if parts.username:
+            auth = quote(parts.username, safe="%")
+            if parts.password:
+                auth += ":" + quote(parts.password, safe="%")
+            auth += "@"
+
+        port = f":{parts.port}" if parts.port else ""
+        netloc = f"{auth}{host}{port}"
+
+    return urlunsplit((parts.scheme, netloc, path, query, fragment))
+
+
 def build_request(url, token=None, wp_url=None):
-    request = Request(url, method="GET")
+    safe_url = safe_url_for_request(url)
+    request = Request(safe_url, method="GET")
     if token and wp_url:
-        if urlparse(url).netloc == urlparse(wp_url).netloc:
+        if urlparse(safe_url).netloc == urlparse(safe_url_for_request(wp_url)).netloc:
             request.add_header("Authorization", f"Basic {token}")
     return request
 
@@ -77,6 +103,8 @@ def fetch_url(request, timeout, retries):
             last_error = str(error)
         except TimeoutError as error:
             last_error = str(error)
+        except Exception as error:
+            last_error = f"{type(error).__name__}: {error}"
 
         if attempt < attempts:
             time.sleep(min(2 ** (attempt - 1), 5))
@@ -93,17 +121,29 @@ def download_thumbnail(item, idx, thumbnails_dir, token, wp_url, timeout, retrie
     filename = safe_filename(urlparse(image_url).path, f"media-{media_id}.jpg")
     local_path = thumbnails_dir / f"{idx:03d}-{media_id}-{filename}"
 
-    request = build_request(image_url, token=token, wp_url=wp_url)
+    try:
+        safe_image_url = safe_url_for_request(image_url)
+        request = build_request(image_url, token=token, wp_url=wp_url)
+    except Exception as error:
+        return image_url, "", "invalid_url", f"{type(error).__name__}: {error}"
+
     status, body, error = fetch_url(request, timeout=timeout, retries=retries)
     if error or status != 200:
-        return image_url, "", str(status), error or f"HTTP {status}"
+        return safe_image_url, "", str(status), error or f"HTTP {status}"
 
-    local_path.write_bytes(body)
-    return image_url, local_path.as_posix(), str(status), ""
+    try:
+        local_path.write_bytes(body)
+    except Exception as error:
+        return safe_image_url, "", "write_error", f"{type(error).__name__}: {error}"
+
+    return safe_image_url, local_path.as_posix(), str(status), ""
 
 
-def fetch_media_page(wp_url, token, limit, page, timeout):
-    per_page = min(MAX_REST_PER_PAGE, limit)
+def fetch_media_page(wp_url, token, remaining_limit, page, timeout):
+    if remaining_limit is None:
+        per_page = MAX_REST_PER_PAGE
+    else:
+        per_page = min(MAX_REST_PER_PAGE, remaining_limit)
     api_url = (
         f"{wp_url}/wp-json/wp/v2/media?"
         + urlencode(
@@ -135,8 +175,8 @@ def fetch_media_items(wp_url, token, limit, timeout):
     run_log_rows = []
     page = 1
 
-    while len(items) < limit:
-        remaining = limit - len(items)
+    while limit is None or len(items) < limit:
+        remaining = None if limit is None else limit - len(items)
         api_url, page_items, status = fetch_media_page(
             wp_url,
             token,
@@ -149,15 +189,19 @@ def fetch_media_items(wp_url, token, limit, timeout):
                 "method": "GET",
                 "url": api_url,
                 "status": status,
+                "error": "",
             }
         )
 
         if not page_items:
             break
 
-        items.extend(page_items[:remaining])
+        if remaining is None:
+            items.extend(page_items)
+        else:
+            items.extend(page_items[:remaining])
 
-        if len(page_items) < min(MAX_REST_PER_PAGE, remaining):
+        if len(page_items) < MAX_REST_PER_PAGE:
             break
 
         page += 1
@@ -169,15 +213,24 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--latest-20", action="store_true")
-    parser.add_argument("--limit", type=int, default=20)
+    parser.add_argument("--limit", default="300")
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--skip-posts", action="store_true")
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--retries", type=int, default=1)
 
     args = parser.parse_args()
-    if args.limit < 1:
-        raise SystemExit("--limit must be a positive integer")
+    if str(args.limit).lower() == "all":
+        requested_limit = "all"
+        fetch_limit = None
+    else:
+        try:
+            requested_limit = int(args.limit)
+        except ValueError as error:
+            raise SystemExit("--limit must be a positive integer or 'all'") from error
+        if requested_limit < 1:
+            raise SystemExit("--limit must be a positive integer or 'all'")
+        fetch_limit = requested_limit
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -196,7 +249,7 @@ def main():
     data, run_log_rows = fetch_media_items(
         wp_url,
         token,
-        args.limit,
+        fetch_limit,
         args.timeout,
     )
 
@@ -243,7 +296,8 @@ def main():
                 {
                     "method": "GET",
                     "url": thumb_url,
-                    "status": status if not error else f"{status}: {error}",
+                    "status": status,
+                    "error": error,
                 }
             )
 
@@ -326,13 +380,14 @@ def main():
                 "method",
                 "url",
                 "status",
+                "error",
             ],
         )
         writer.writeheader()
         writer.writerows(run_log_rows)
 
     summary = {
-        "requested_limit": args.limit,
+        "requested_limit": requested_limit,
         "fetched_count": len(image_rows),
         "media_count": len(image_rows),
         "group_count": len(group_rows),
