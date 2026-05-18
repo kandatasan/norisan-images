@@ -1,0 +1,185 @@
+name: WordPress media latest 20 test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wp-media-test:
+    name: GET latest 20 WordPress media items
+    runs-on: ubuntu-latest
+    env:
+      WP_URL: ${{ secrets.WP_URL }}
+      WP_USER: ${{ secrets.WP_USER }}
+      WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+      OUTPUT_DIR: wp-media-test-output
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::add-mask::${WP_APP_PASSWORD}"
+          missing=0
+          for name in WP_URL WP_USER WP_APP_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error title=Missing secret::GitHub Secret ${name} is required for this manual workflow."
+              missing=1
+            fi
+          done
+          if [ "${missing}" -ne 0 ]; then
+            exit 2
+          fi
+
+      - name: Run latest 20 media GET export
+        id: export
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo "::add-mask::${WP_APP_PASSWORD}"
+          mkdir -p "${OUTPUT_DIR}"
+
+          python3 scripts/organize_wp_media.py 
+            --output-dir "${OUTPUT_DIR}" 
+            --latest-20 
+            --no-download 
+            --skip-posts 
+            --timeout 30 
+            --retries 1 
+            > "${OUTPUT_DIR}/run.stdout.log" 
+            2> "${OUTPUT_DIR}/run.stderr.log"
+          status=$?
+
+          if [ -s "${OUTPUT_DIR}/run.stdout.log" ]; then
+            echo "::group::organizer stdout"
+            cat "${OUTPUT_DIR}/run.stdout.log"
+            echo "::endgroup::"
+          fi
+          if [ -s "${OUTPUT_DIR}/run.stderr.log" ]; then
+            echo "::group::organizer stderr"
+            cat "${OUTPUT_DIR}/run.stderr.log"
+            echo "::endgroup::"
+          fi
+          if [ -f "${OUTPUT_DIR}/media-organizer-summary.json" ]; then
+            echo "::group::media organizer summary"
+            cat "${OUTPUT_DIR}/media-organizer-summary.json"
+            echo "::endgroup::"
+          fi
+          if [ "${status}" -ne 0 ]; then
+            echo "::error title=WordPress media export failed::Latest-20 GET export failed. Check media-organizer-summary.json and run.stderr.log in the artifact."
+            exit "${status}"
+          fi
+
+      - name: Verify CSV and GET-only safety
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv
+          import json
+          from pathlib import Path
+          from urllib.parse import parse_qs, urlparse
+
+          output = Path("wp-media-test-output")
+          index_path = output / "image-index.csv"
+          groups_path = output / "image-groups.csv"
+          run_log_path = output / "media-organizer-run-log.csv"
+          summary_path = output / "media-organizer-summary.json"
+
+          if not index_path.exists():
+              raise SystemExit("image-index.csv was not generated")
+          if not groups_path.exists():
+              raise SystemExit("image-groups.csv was not generated")
+          if not run_log_path.exists():
+              raise SystemExit("media-organizer-run-log.csv was not generated")
+          if not summary_path.exists():
+              raise SystemExit("media-organizer-summary.json was not generated")
+
+          with index_path.open(newline="", encoding="utf-8") as file_obj:
+              reader = csv.DictReader(file_obj)
+              rows = list(reader)
+              fieldnames = reader.fieldnames or []
+
+          required_columns = [
+              "filename",
+              "title",
+              "alt",
+              "category",
+              "possible_article",
+              "upload_date",
+              "image_url"
+          ]
+
+          if fieldnames != required_columns:
+              raise SystemExit(f"Unexpected image-index.csv columns: {fieldnames}")
+
+          with run_log_path.open(newline="", encoding="utf-8") as file_obj:
+              log_rows = list(csv.DictReader(file_obj))
+
+          methods = {row["method"] for row in log_rows if row.get("method")}
+          non_get = sorted(method for method in methods if method != "GET")
+
+          if non_get:
+              raise SystemExit(f"Forbidden HTTP methods found in run log: {', '.join(non_get)}")
+
+          media_requests = [
+              row for row in log_rows
+              if "/wp-json/wp/v2/media" in row.get("url", "")
+          ]
+
+          if not media_requests:
+              raise SystemExit("No WordPress media endpoint GET was recorded")
+
+          parsed = parse_qs(urlparse(media_requests[0]["url"]).query)
+
+          expected = {
+              "per_page": "20",
+              "orderby": "date",
+              "order": "desc",
+              "media_type": "image"
+          }
+
+          for key, value in expected.items():
+              actual = parsed.get(key, [None])[0]
+              if actual != value:
+                  raise SystemExit(
+                      f"Expected media query {key}={value}, got {actual}"
+                  )
+
+          summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+          if summary.get("methods_used") and set(summary["methods_used"]) - {"GET"}:
+              raise SystemExit(
+                  f"Forbidden methods in summary: {summary['methods_used']}"
+              )
+
+          print(
+              f"OK: image-index.csv rows={len(rows)}, "
+              f"WordPress methods={sorted(methods) or ['GET']}"
+          )
+          PY
+
+      - name: Upload media test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wp-media-latest-20-${{ github.run_id }}
+          path: |
+            ${{ env.OUTPUT_DIR }}/image-index.csv
+            ${{ env.OUTPUT_DIR }}/image-groups.csv
+            ${{ env.OUTPUT_DIR }}/media-organizer-summary.json
+            ${{ env.OUTPUT_DIR }}/media-organizer-run-log.csv
+            ${{ env.OUTPUT_DIR }}/run.stdout.log
+            ${{ env.OUTPUT_DIR }}/run.stderr.log
+          if-no-files-found: warn
+          retention-days: 14
