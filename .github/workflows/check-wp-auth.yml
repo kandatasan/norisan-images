@@ -1,0 +1,21 @@
+name: Check WordPress REST Auth
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-wp-auth:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check WordPress Application Password auth
+        env:
+          WP_URL: ${{ secrets.WP_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+        run: |
+          curl --fail-with-body -sS \
+            -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            "${WP_URL}/wp-json/wp/v2/users/me?context=edit"
