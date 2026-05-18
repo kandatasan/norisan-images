@@ -15,26 +15,50 @@ from urllib.request import Request, urlopen
 MAX_REST_PER_PAGE = 100
 
 
+CATEGORY_RULES = [
+    ("car/lexus", ["lexus", "ux", "f sport", "fsport"]),
+    ("car/tanto", ["tanto", "タント"]),
+    ("genre/fishing", ["fish", "fishing", "釣", "ナマズ", "catfish"]),
+    ("genre/gourmet", ["food", "gourmet", "グルメ", "cafe", "café", "カフェ"]),
+    ("genre/travel", ["travel", "trip", "shrine", "temple", "鳥居", "神社", "寺"]),
+    ("genre/leisure", ["leisure", "レジャー", "camp", "camping", "キャンプ"]),
+    ("genre/car", ["car", "車", "クルマ", "ドライブ"]),
+    ("location/hiroshima", ["hiroshima", "広島", "miyajima", "宮島", "itsukushima", "厳島"]),
+    ("location/shimane", ["shimane", "島根", "izumo", "出雲"]),
+    ("location/tottori", ["tottori", "鳥取", "sand", "dunes", "砂丘"]),
+    ("location/yamaguchi", ["yamaguchi", "山口"]),
+    ("location/fukuoka", ["fukuoka", "福岡"]),
+    ("location/oita", ["oita", "ooita", "大分"]),
+    ("location/awaji", ["awaji", "淡路"]),
+]
+
+
 def guess_category(text):
     text = (text or "").lower()
 
-    if "ux" in text or "lexus" in text:
-        return "lexus/interior"
-
-    if "muv" in text:
-        return "muv/exterior"
-
-    if "fish" in text or "釣" in text:
-        return "tsurikue/fishing"
+    for category, keywords in CATEGORY_RULES:
+        if any(keyword in text for keyword in keywords):
+            return category
 
     return "unknown"
 
 
 def guess_article(category):
     mapping = {
-        "lexus/interior": "レクサスUX内装レビュー",
-        "muv/exterior": "ムーバレー体験記事",
-        "tsurikue/fishing": "釣り体験記事",
+        "car/lexus": "レクサスUX関連記事",
+        "car/tanto": "タント関連記事",
+        "genre/car": "車関連記事",
+        "genre/fishing": "釣り体験記事",
+        "genre/leisure": "レジャー関連記事",
+        "genre/travel": "旅行関連記事",
+        "genre/gourmet": "グルメ関連記事",
+        "location/hiroshima": "広島関連記事",
+        "location/shimane": "島根関連記事",
+        "location/tottori": "鳥取関連記事",
+        "location/yamaguchi": "山口関連記事",
+        "location/fukuoka": "福岡関連記事",
+        "location/oita": "大分関連記事",
+        "location/awaji": "淡路関連記事",
         "unknown": "未分類記事候補",
     }
     return mapping.get(category, "未分類記事候補")
@@ -271,7 +295,7 @@ def main():
         filename = safe_filename(urlparse(source_url).path, f"media-{item.get('id') or idx}")
 
         category = guess_category(
-            f"{title} {alt} {filename}"
+            f"{title} {alt} {filename} {source_url}"
         )
 
         possible_article = guess_article(category)
