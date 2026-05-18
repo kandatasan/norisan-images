@@ -12,6 +12,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
+MAX_REST_PER_PAGE = 100
+
 
 def guess_category(text):
     text = (text or "").lower()
@@ -100,16 +102,82 @@ def download_thumbnail(item, idx, thumbnails_dir, token, wp_url, timeout, retrie
     return image_url, local_path.as_posix(), str(status), ""
 
 
+def fetch_media_page(wp_url, token, limit, page, timeout):
+    per_page = min(MAX_REST_PER_PAGE, limit)
+    api_url = (
+        f"{wp_url}/wp-json/wp/v2/media?"
+        + urlencode(
+            {
+                "per_page": per_page,
+                "page": page,
+                "orderby": "date",
+                "order": "desc",
+                "media_type": "image",
+            }
+        )
+    )
+
+    request = Request(api_url, method="GET")
+    request.add_header("Authorization", f"Basic {token}")
+
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+            return api_url, data, str(response.status)
+    except HTTPError as error:
+        if error.code == 400 and page > 1:
+            return api_url, [], str(error.code)
+        raise
+
+
+def fetch_media_items(wp_url, token, limit, timeout):
+    items = []
+    run_log_rows = []
+    page = 1
+
+    while len(items) < limit:
+        remaining = limit - len(items)
+        api_url, page_items, status = fetch_media_page(
+            wp_url,
+            token,
+            remaining,
+            page,
+            timeout,
+        )
+        run_log_rows.append(
+            {
+                "method": "GET",
+                "url": api_url,
+                "status": status,
+            }
+        )
+
+        if not page_items:
+            break
+
+        items.extend(page_items[:remaining])
+
+        if len(page_items) < min(MAX_REST_PER_PAGE, remaining):
+            break
+
+        page += 1
+
+    return items, run_log_rows
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--latest-20", action="store_true")
+    parser.add_argument("--limit", type=int, default=20)
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--skip-posts", action="store_true")
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--retries", type=int, default=1)
 
     args = parser.parse_args()
+    if args.limit < 1:
+        raise SystemExit("--limit must be a positive integer")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -121,41 +189,21 @@ def main():
     wp_user = os.environ["WP_USER"]
     wp_password = os.environ["WP_APP_PASSWORD"]
 
-    api_url = (
-        f"{wp_url}/wp-json/wp/v2/media?"
-        + urlencode(
-            {
-                "per_page": 20,
-                "orderby": "date",
-                "order": "desc",
-                "media_type": "image",
-            }
-        )
-    )
-
     token = base64.b64encode(
         f"{wp_user}:{wp_password}".encode()
     ).decode()
 
-    request = Request(api_url, method="GET")
-    request.add_header("Authorization", f"Basic {token}")
-
-    with urlopen(request, timeout=args.timeout) as response:
-        data = json.loads(response.read().decode("utf-8"))
+    data, run_log_rows = fetch_media_items(
+        wp_url,
+        token,
+        args.limit,
+        args.timeout,
+    )
 
     image_rows = []
     group_rows = []
-    run_log_rows = []
     thumbnail_saved_count = 0
     thumbnail_error_count = 0
-
-    run_log_rows.append(
-        {
-            "method": "GET",
-            "url": api_url,
-            "status": "200",
-        }
-    )
 
     for idx, item in enumerate(data, start=1):
         title = (
@@ -284,6 +332,8 @@ def main():
         writer.writerows(run_log_rows)
 
     summary = {
+        "requested_limit": args.limit,
+        "fetched_count": len(image_rows),
         "media_count": len(image_rows),
         "group_count": len(group_rows),
         "thumbnail_saved_count": thumbnail_saved_count,
