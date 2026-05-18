@@ -216,13 +216,19 @@ jobs:
               ai_log_reader = csv.DictReader(file_obj)
               ai_log_rows = list(ai_log_reader)
               ai_log_fieldnames = ai_log_reader.fieldnames or []
-          required_ai_log_columns = ["filename", "width", "height", "ai_category", "ai_reason", "local_path", "preview_path", "text_category", "ai_image_dimensions", "final_category", "ai_status"]
+          required_ai_log_columns = ["filename", "width", "height", "ai_category", "ai_reason", "local_path", "preview_path", "text_category", "ai_image_dimensions", "final_category", "ai_status", "ai_parse_status", "ai_parse_error", "ai_response_text", "ai_http_status", "ai_openai_error_message", "ai_debug_path"]
           if ai_log_fieldnames != required_ai_log_columns:
               raise SystemExit(f"Unexpected ai-category-log.csv columns: {ai_log_fieldnames}")
           if expected_ai_enabled and len(ai_log_rows) != len(rows):
               raise SystemExit(f"Expected AI log rows to match image rows when enabled: {len(ai_log_rows)} != {len(rows)}")
           if not expected_ai_enabled and ai_log_rows:
               raise SystemExit("AI log rows should be empty when AI classification is disabled")
+          for row in ai_log_rows:
+              debug_path = row.get("ai_debug_path", "")
+              if debug_path and not (output / debug_path).is_file():
+                  raise SystemExit(f"ai_debug_path file does not exist: {debug_path}")
+              if row.get("ai_parse_status") == "http_error" and not row.get("ai_http_status"):
+                  raise SystemExit("http_error row must include ai_http_status")
 
           with groups_path.open(newline="", encoding="utf-8") as file_obj:
               group_reader = csv.DictReader(file_obj)
@@ -277,10 +283,14 @@ jobs:
               f"- サムネイル保存件数: {summary.get('thumbnail_saved_count', 0)} 件",
               f"- サムネイル取得失敗件数: {summary.get('thumbnail_error_count', 0)} 件",
               f"- AI画像分類: {'有効' if summary.get('ai_classification_enabled') else '無効'}",
+              f"- OpenAI model: {summary.get('ai_model') or 'なし'}",
               f"- AI分類対象上限: {summary.get('ai_limit', 0)} 件",
               f"- AI分類試行件数: {summary.get('ai_classified_count', 0)} 件",
               f"- AIでunknownから分類できた件数: {summary.get('ai_reclassified_count', 0)} 件",
               f"- AI分類エラー件数: {summary.get('ai_error_count', 0)} 件",
+              f"- OpenAI HTTP status counts: {summary.get('ai_http_status_counts', {})}",
+              f"- Latest OpenAI HTTP status: {summary.get('ai_last_http_status') or 'なし'}",
+              f"- Latest OpenAI error message: {summary.get('ai_last_error_message') or 'なし'}",
               "",
               "## 2. image-index.csv サンプル5件",
               "",
@@ -311,10 +321,10 @@ jobs:
               with ai_log_path.open(newline="", encoding="utf-8") as file_obj:
                   ai_rows = list(csv.DictReader(file_obj))
               if ai_rows:
-                  lines.extend(["", "| filename | size | ai_category | final_category | status | reason |", "| --- | --- | --- | --- | --- | --- |"])
+                  lines.extend(["", "| filename | size | ai_category | final_category | status | HTTP | OpenAI error | reason |", "| --- | --- | --- | --- | --- | --- | --- | --- |"])
                   for row in ai_rows[:10]:
                       size = "x".join(value for value in [row.get("width", ""), row.get("height", "")] if value)
-                      values = [row["filename"], size, row["ai_category"], row["final_category"], row["ai_status"], row["ai_reason"]]
+                      values = [row["filename"], size, row["ai_category"], row["final_category"], row["ai_status"], row.get("ai_http_status", ""), row.get("ai_openai_error_message", ""), row["ai_reason"]]
                       escaped = [value.replace("|", "\\|").replace("\n", " ") for value in values]
                       lines.append("| " + " | ".join(escaped) + " |")
               else:
@@ -381,6 +391,7 @@ jobs:
               "サムネイル保存件数",
               "サムネイル取得失敗件数",
               "AI画像分類",
+              "OpenAI model",
               "AI分類試行件数",
               "AIでunknownから分類できた件数",
               "## 安全確認",
