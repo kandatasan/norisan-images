@@ -318,39 +318,73 @@ def image_file_to_data_url(image_path):
 
 def extract_response_text(response_data):
     output_text = response_data.get("output_text")
-    if output_text:
+    if isinstance(output_text, str) and output_text.strip():
         return output_text
 
     output_parts = []
-    for output_item in response_data.get("output", []) or []:
-        for content_item in output_item.get("content", []) or []:
-            if content_item.get("type") in {"output_text", "text"}:
-                text = content_item.get("text")
-                if text:
-                    output_parts.append(text)
-    return "\n".join(output_parts)
+
+    def collect_text(value):
+        if isinstance(value, dict):
+            item_type = value.get("type")
+            text = value.get("text")
+            if item_type in {"output_text", "text", "refusal"} and isinstance(text, str):
+                output_parts.append(text)
+                return
+            for child in value.values():
+                collect_text(child)
+        elif isinstance(value, list):
+            for child in value:
+                collect_text(child)
+
+    collect_text(response_data.get("output", []))
+    return "\n".join(part for part in output_parts if part)
+
+
+def strip_markdown_json_fence(response_text):
+    cleaned = (response_text or "").strip()
+    match = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        return match.group(1).strip(), "markdown_json_fence"
+    return cleaned, "plain_text"
 
 
 def parse_ai_category_response(response_text):
-    cleaned = (response_text or "").strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.strip("`")
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:].strip()
+    cleaned, parse_status = strip_markdown_json_fence(response_text)
+    parsed = None
+    parse_error = ""
 
     try:
         parsed = json.loads(cleaned)
-    except json.JSONDecodeError:
-        return "unknown", cleaned[:200] or "AI response was not valid JSON"
+    except json.JSONDecodeError as error:
+        parse_error = f"JSONDecodeError: {error}"
+        json_match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if json_match:
+            try:
+                parsed = json.loads(json_match.group(0))
+                parse_status = "json_substring"
+                parse_error = ""
+            except json.JSONDecodeError as substring_error:
+                parse_error = f"JSONDecodeError after substring extraction: {substring_error}"
 
-    category = parsed.get("category", "unknown")
-    if category not in AI_CATEGORIES:
-        category = "unknown"
+    if not isinstance(parsed, dict):
+        fallback_reason = cleaned[:300] or "AI response was not valid JSON"
+        return "unknown", fallback_reason, "parse_error", parse_error or "AI response was not a JSON object"
+
+    raw_category = str(parsed.get("category", "unknown")).strip()
+    normalized_category = raw_category.lower()
+    if normalized_category not in AI_CATEGORIES:
+        reason = str(parsed.get("reason", "")).strip() or "No reason returned"
+        return (
+            "unknown",
+            reason[:300],
+            "invalid_category",
+            f"category {raw_category!r} is not in allowed categories",
+        )
 
     reason = str(parsed.get("reason", "")).strip()
     if not reason:
         reason = "No reason returned"
-    return category, reason[:300]
+    return normalized_category, reason[:300], parse_status, ""
 
 
 def classify_thumbnail_with_openai(image_path, model, api_key, timeout):
@@ -398,28 +432,60 @@ def classify_thumbnail_with_openai(image_path, model, api_key, timeout):
     with urlopen(request, timeout=timeout) as response:
         response_data = json.loads(response.read().decode("utf-8"))
 
-    return parse_ai_category_response(extract_response_text(response_data))
+    response_text = extract_response_text(response_data)
+    category, reason, parse_status, parse_error = parse_ai_category_response(response_text)
+    debug_data = {
+        "model": model,
+        "image": image_path.name,
+        "response_text": response_text,
+        "parse_status": parse_status,
+        "parse_error": parse_error,
+        "parsed_category": category,
+        "parsed_reason": reason,
+        "raw_response": response_data,
+    }
+    return category, reason, parse_status, parse_error, response_text, debug_data
 
 
 def maybe_classify_thumbnail(image_path, model, api_key, timeout):
     if not api_key:
-        return "unknown", "OPENAI_API_KEY is not set", "skipped"
+        return "unknown", "OPENAI_API_KEY is not set", "skipped", "", "", "", {}
     if not image_path or not image_path.is_file():
-        return "unknown", "thumbnail file is missing", "skipped"
+        return "unknown", "thumbnail file is missing", "skipped", "", "", "", {}
 
     try:
-        category, reason = classify_thumbnail_with_openai(image_path, model, api_key, timeout)
+        category, reason, parse_status, parse_error, response_text, debug_data = classify_thumbnail_with_openai(image_path, model, api_key, timeout)
     except HTTPError as error:
-        error_body = error.read().decode("utf-8", errors="replace")[:300]
-        return "unknown", f"OpenAI HTTP {error.code}: {error_body}", "error"
+        error_body = error.read().decode("utf-8", errors="replace")[:1000]
+        debug_data = {
+            "model": model,
+            "image": image_path.name,
+            "http_status": error.code,
+            "error_body": error_body,
+        }
+        return "unknown", f"OpenAI HTTP {error.code}: {error_body[:300]}", "error", "http_error", error_body, "", debug_data
     except URLError as error:
-        return "unknown", f"OpenAI URL error: {error}", "error"
+        return "unknown", f"OpenAI URL error: {error}", "error", "url_error", str(error), "", {}
     except TimeoutError as error:
-        return "unknown", f"OpenAI timeout: {error}", "error"
+        return "unknown", f"OpenAI timeout: {error}", "error", "timeout", str(error), "", {}
     except Exception as error:
-        return "unknown", f"OpenAI error: {type(error).__name__}: {error}", "error"
+        return "unknown", f"OpenAI error: {type(error).__name__}: {error}", "error", "exception", str(error), "", {}
 
-    return category, reason, "classified"
+    return category, reason, "classified", parse_status, parse_error, response_text, debug_data
+
+
+def write_ai_debug_json(debug_dir, idx, filename, debug_data):
+    if not debug_data:
+        return ""
+
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    debug_name = f"{idx:03d}-{safe_filename(filename, f'ai-debug-{idx}.json')}.json"
+    debug_path = debug_dir / debug_name
+    debug_path.write_text(
+        json.dumps(debug_data, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return debug_path.name
 
 
 def download_thumbnail(item, idx, thumbnails_dir, token, wp_url, timeout, retries):
@@ -602,9 +668,11 @@ def main():
         ai_candidate_indexes = set(random.sample(unknown_candidate_indexes, sample_count))
 
     ai_preview_dir = output_dir / "ai-preview"
+    ai_debug_dir = output_dir / "ai-debug"
     ai_preview_rows = []
     if args.ai_classify:
         ai_preview_dir.mkdir(parents=True, exist_ok=True)
+        ai_debug_dir.mkdir(parents=True, exist_ok=True)
 
     for idx, item in enumerate(data, start=1):
         title = (
@@ -625,6 +693,10 @@ def main():
         ai_category = "unknown" if args.ai_classify else ""
         ai_reason = "text category already matched; AI skipped" if args.ai_classify and text_category != "unknown" else ""
         ai_status = "skipped" if args.ai_classify and text_category != "unknown" else "not_requested"
+        ai_parse_status = ""
+        ai_parse_error = ""
+        ai_response_text = ""
+        ai_debug_path = ""
 
         local_path = ""
         thumbnail_path = None
@@ -665,12 +737,22 @@ def main():
                     idx,
                     filename,
                 )
-                ai_category, ai_reason, ai_status = maybe_classify_thumbnail(
+                (
+                    ai_category,
+                    ai_reason,
+                    ai_status,
+                    ai_parse_status,
+                    ai_parse_error,
+                    ai_response_text,
+                    ai_debug_data,
+                ) = maybe_classify_thumbnail(
                     thumbnail_path,
                     args.ai_model,
                     openai_api_key,
                     args.timeout,
                 )
+                ai_debug_name = write_ai_debug_json(ai_debug_dir, idx, filename, ai_debug_data)
+                ai_debug_path = f"ai-debug/{ai_debug_name}" if ai_debug_name else ""
                 ai_classified_count += 1
                 if ai_status == "error":
                     ai_error_count += 1
@@ -697,6 +779,10 @@ def main():
                     "ai_image_dimensions": ai_image_dimensions,
                     "final_category": category,
                     "ai_status": ai_status,
+                    "ai_parse_status": ai_parse_status,
+                    "ai_parse_error": ai_parse_error,
+                    "ai_response_text": ai_response_text[:1000],
+                    "ai_debug_path": ai_debug_path,
                 }
             )
             if preview_name:
@@ -804,6 +890,10 @@ def main():
                 "ai_image_dimensions",
                 "final_category",
                 "ai_status",
+                "ai_parse_status",
+                "ai_parse_error",
+                "ai_response_text",
+                "ai_debug_path",
             ],
         )
         writer.writeheader()
@@ -845,6 +935,7 @@ def main():
         "ai_reclassified_count": ai_reclassified_count,
         "ai_error_count": ai_error_count,
         "ai_preview_count": len(ai_preview_rows),
+        "ai_debug_count": len(list(ai_debug_dir.glob("*.json"))) if args.ai_classify and ai_debug_dir.exists() else 0,
         "methods_used": ["GET"],
         "status": "success",
     }
