@@ -49,15 +49,7 @@ jobs:
           echo "::add-mask::${WP_APP_PASSWORD}"
           mkdir -p "${OUTPUT_DIR}"
 
-          python3 scripts/organize_wp_media.py 
-            --output-dir "${OUTPUT_DIR}" 
-            --latest-20 
-            --no-download 
-            --skip-posts 
-            --timeout 30 
-            --retries 1 
-            > "${OUTPUT_DIR}/run.stdout.log" 
-            2> "${OUTPUT_DIR}/run.stderr.log"
+          python3 scripts/organize_wp_media.py --output-dir "${OUTPUT_DIR}" --latest-20 --no-download --skip-posts --timeout 30 --retries 1 > "${OUTPUT_DIR}/run.stdout.log" 2> "${OUTPUT_DIR}/run.stderr.log"
           status=$?
 
           if [ -s "${OUTPUT_DIR}/run.stdout.log" ]; then
@@ -87,6 +79,7 @@ jobs:
           python3 - <<'PY'
           import csv
           import json
+          import sys
           from pathlib import Path
           from urllib.parse import parse_qs, urlparse
 
@@ -109,64 +102,254 @@ jobs:
               reader = csv.DictReader(file_obj)
               rows = list(reader)
               fieldnames = reader.fieldnames or []
+          if len(rows) > 20:
+              raise SystemExit(f"Expected at most 20 media rows, got {len(rows)}")
 
-          required_columns = [
-              "filename",
-              "title",
-              "alt",
-              "category",
-              "possible_article",
-              "upload_date",
-              "image_url"
-          ]
-
+          required_columns = ["filename", "title", "alt", "category", "possible_article", "upload_date", "image_url"]
           if fieldnames != required_columns:
               raise SystemExit(f"Unexpected image-index.csv columns: {fieldnames}")
 
           with run_log_path.open(newline="", encoding="utf-8") as file_obj:
               log_rows = list(csv.DictReader(file_obj))
-
           methods = {row["method"] for row in log_rows if row.get("method")}
           non_get = sorted(method for method in methods if method != "GET")
-
           if non_get:
               raise SystemExit(f"Forbidden HTTP methods found in run log: {', '.join(non_get)}")
 
-          media_requests = [
-              row for row in log_rows
-              if "/wp-json/wp/v2/media" in row.get("url", "")
-          ]
-
+          media_requests = [row for row in log_rows if "/wp-json/wp/v2/media" in row.get("url", "")]
           if not media_requests:
               raise SystemExit("No WordPress media endpoint GET was recorded")
-
           parsed = parse_qs(urlparse(media_requests[0]["url"]).query)
-
-          expected = {
-              "per_page": "20",
-              "orderby": "date",
-              "order": "desc",
-              "media_type": "image"
-          }
-
+          expected = {"per_page": "20", "orderby": "date", "order": "desc", "media_type": "image"}
           for key, value in expected.items():
               actual = parsed.get(key, [None])[0]
               if actual != value:
-                  raise SystemExit(
-                      f"Expected media query {key}={value}, got {actual}"
-                  )
+                  raise SystemExit(f"Expected media query {key}={value}, got {actual}")
 
           summary = json.loads(summary_path.read_text(encoding="utf-8"))
+          if summary.get("media_count") != len(rows):
+              raise SystemExit(f"Summary media_count {summary.get('media_count')} does not match CSV rows {len(rows)}")
+          methods_used = set(summary.get("methods_used", []))
+          if methods_used - {"GET"}:
+              raise SystemExit(f"Forbidden methods in summary: {sorted(methods_used - {'GET'})}")
 
-          if summary.get("methods_used") and set(summary["methods_used"]) - {"GET"}:
-              raise SystemExit(
-                  f"Forbidden methods in summary: {summary['methods_used']}"
-              )
+          with groups_path.open(newline="", encoding="utf-8") as file_obj:
+              group_reader = csv.DictReader(file_obj)
+              group_rows = list(group_reader)
+              group_fieldnames = group_reader.fieldnames or []
+          required_group_columns = ["group_id", "match_type", "category", "filenames", "image_urls"]
+          if group_fieldnames != required_group_columns:
+              raise SystemExit(f"Unexpected image-groups.csv columns: {group_fieldnames}")
+          if summary.get("group_count") != len(group_rows):
+              raise SystemExit(f"Summary group_count {summary.get('group_count')} does not match group CSV rows {len(group_rows)}")
 
-          print(
-              f"OK: image-index.csv rows={len(rows)}, "
-              f"WordPress methods={sorted(methods) or ['GET']}"
-          )
+          print(f"OK: image-index.csv rows={len(rows)}, image-groups.csv rows={len(group_rows)}, WordPress methods={sorted(methods) or ['GET']}, latest query verified")
+          PY
+
+      - name: Write AI inference report
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import csv
+          import json
+          from collections import Counter
+          from pathlib import Path
+
+          output = Path("wp-media-test-output")
+          index_path = output / "image-index.csv"
+          summary_path = output / "media-organizer-summary.json"
+          report_path = output / "ai-inference-report.md"
+
+          with index_path.open(newline="", encoding="utf-8") as file_obj:
+              rows = list(csv.DictReader(file_obj))
+          summary = json.loads(summary_path.read_text(encoding="utf-8"))
+          categories = Counter(row["category"] for row in rows)
+          priority_categories = [
+              "muv/tunnel", "muv/food", "muv/exterior", "muv/map",
+              "lexus/koukai", "lexus/luggage", "lexus/visibility", "lexus/interior",
+              "tsurikue/fishing", "tsurikue/food", "tsurikue/gear", "tsurikue/spot",
+          ]
+
+          lines = [
+              "# WordPressメディア最新20件 AI推測レポート",
+              "",
+              "## 1. 取得件数",
+              f"- 取得件数: {len(rows)} 件",
+              f"- Summary media_count: {summary.get('media_count')} 件",
+              f"- 類似画像グループ数: {summary.get('group_count')} 件",
+              "",
+              "## 2. image-index.csv サンプル5件",
+              "",
+              "| filename | title | category | possible_article | upload_date |",
+              "| --- | --- | --- | --- | --- |",
+          ]
+          for row in rows[:5]:
+              values = [row["filename"], row["title"], row["category"], row["possible_article"], row["upload_date"]]
+              escaped = [value.replace("|", "\\|").replace("\n", " ") for value in values]
+              lines.append("| " + " | ".join(escaped) + " |")
+          if not rows:
+              lines.append("| （該当なし） |  |  |  |  |")
+
+          lines.extend(["", "## 3. 推測カテゴリ一覧"])
+          if categories:
+              for category, count in sorted(categories.items()):
+                  lines.append(f"- `{category}`: {count} 件")
+          else:
+              lines.append("- 該当なし")
+
+          lines.extend(["", "### 優先カテゴリ別ヒット状況"])
+          for category in priority_categories:
+              lines.append(f"- `{category}`: {categories.get(category, 0)} 件")
+
+          lines.extend(["", "## 4. possible_article サンプル"])
+          for row in rows[:5]:
+              lines.append(f"- {row['filename']}: {row['possible_article']}")
+          if not rows:
+              lines.append("- 該当なし")
+
+          lines.extend([
+              "",
+              "## 5. 次段階の提案",
+              "- CSVを確認し、`unknown` または意図と違うカテゴリのキーワードを追加する。",
+              "- 必要に応じて `--no-download` を外した画像保存テストに進み、サムネイル確認と重複ハッシュ検出を行う。",
+              "- 記事テーマ別に `possible_article` の候補名を調整し、将来の『記事テーマ → 関連画像候補』表示に使える辞書を育てる。",
+              "",
+              "## 確認結果",
+              f"- CSV構造: `image-index.csv` {len(rows)} 行、`image-groups.csv` {summary.get('group_count')} 行を検証済み。",
+              "- エラーログ品質: 失敗時は `run.stderr.log` と `media-organizer-summary.json` を artifact に残します。",
+              "",
+              "## 安全確認",
+              "- この workflow は GET のみを許可し、検証ステップで POST/PUT/DELETE が run log に含まれていないことを確認しています。",
+              "- WordPress投稿、メディア削除、既存記事変更は実行しません。",
+          ])
+
+          report = "\n".join(lines) + "\n"
+          report_path.write_text(report, encoding="utf-8")
+
+          import os
+          github_step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if github_step_summary:
+              with Path(github_step_summary).open("a", encoding="utf-8") as summary_file:
+                  summary_file.write(report)
+
+          print(report)
+          PY
+
+      - name: Verify AI report contents
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          report_path = Path("wp-media-test-output/ai-inference-report.md")
+          if not report_path.exists():
+              raise SystemExit("ai-inference-report.md was not generated")
+          report = report_path.read_text(encoding="utf-8")
+          required_snippets = [
+              "## 1. 取得件数",
+              "## 2. image-index.csv サンプル5件",
+              "## 3. 推測カテゴリ一覧",
+              "### 優先カテゴリ別ヒット状況",
+              "## 4. possible_article サンプル",
+              "## 5. 次段階の提案",
+              "## 安全確認",
+              "muv/tunnel",
+              "muv/food",
+              "muv/exterior",
+              "muv/map",
+              "lexus/koukai",
+              "lexus/luggage",
+              "lexus/visibility",
+              "lexus/interior",
+              "tsurikue/fishing",
+              "tsurikue/food",
+              "tsurikue/gear",
+              "tsurikue/spot",
+              "POST/PUT/DELETE",
+              "WordPress投稿、メディア削除、既存記事変更は実行しません",
+          ]
+          missing = [snippet for snippet in required_snippets if snippet not in report]
+          if missing:
+              raise SystemExit(f"ai-inference-report.md is missing required content: {missing}")
+          print("OK: ai-inference-report.md contains fetched count, category hits, possible_article samples, next steps, and safety confirmation")
+          PY
+
+      - name: Show sample CSV
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::image-index.csv sample"
+          sed -n '1,6p' "${OUTPUT_DIR}/image-index.csv"
+          echo "::endgroup::"
+
+      - name: Write failure diagnosis report
+        if: failure() && !cancelled()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${OUTPUT_DIR}"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          output = Path("wp-media-test-output")
+          report_path = output / "failure-diagnosis.md"
+
+          def read_text(name, limit=12000):
+              path = output / name
+              if not path.exists():
+                  return "（ファイルなし）"
+              text = path.read_text(encoding="utf-8", errors="replace")
+              if len(text) > limit:
+                  return text[:limit] + "\n...（長いため省略）"
+              return text or "（空ファイル）"
+
+          report_lines = [
+              "# WordPressメディア最新20件 失敗診断",
+              "",
+              "## 想定される確認ポイント",
+              "",
+              "- GitHub Secrets `WP_URL`, `WP_USER`, `WP_APP_PASSWORD` が設定されているか。",
+              "- WordPress REST API `/wp-json/wp/v2/media` へ GitHub Actions から到達できるか。",
+              "- Application Password が有効で、メディアの読み取り権限があるか。",
+              "- `media-organizer-run-log.csv` に `GET` 以外が含まれていないか。",
+              "- `media-organizer-summary.json` の `error` を確認する。",
+              "",
+              "## 安全確認",
+              "",
+              "この workflow は `scripts/organize_wp_media.py --latest-20 --no-download --skip-posts` だけを実行します。投稿作成、記事更新、メディア削除、POST/PUT/DELETE は行いません。",
+              "",
+              "## media-organizer-summary.json",
+              "",
+              "```json",
+              read_text("media-organizer-summary.json"),
+              "```",
+              "",
+              "## run.stderr.log",
+              "",
+              "```text",
+              read_text("run.stderr.log"),
+              "```",
+              "",
+              "## media-organizer-run-log.csv",
+              "",
+              "```csv",
+              read_text("media-organizer-run-log.csv"),
+              "```",
+          ]
+          report = "\n".join(report_lines) + "\n"
+          report_path.write_text(report, encoding="utf-8")
+          print(report)
+
+          import os
+          github_step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if github_step_summary:
+              with Path(github_step_summary).open("a", encoding="utf-8") as summary_file:
+                  summary_file.write("\n" + report)
           PY
 
       - name: Upload media test artifacts
@@ -179,6 +362,8 @@ jobs:
             ${{ env.OUTPUT_DIR }}/image-groups.csv
             ${{ env.OUTPUT_DIR }}/media-organizer-summary.json
             ${{ env.OUTPUT_DIR }}/media-organizer-run-log.csv
+            ${{ env.OUTPUT_DIR }}/ai-inference-report.md
+            ${{ env.OUTPUT_DIR }}/failure-diagnosis.md
             ${{ env.OUTPUT_DIR }}/run.stdout.log
             ${{ env.OUTPUT_DIR }}/run.stderr.log
           if-no-files-found: warn
