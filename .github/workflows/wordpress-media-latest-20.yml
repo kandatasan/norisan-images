@@ -49,7 +49,7 @@ jobs:
           echo "::add-mask::${WP_APP_PASSWORD}"
           mkdir -p "${OUTPUT_DIR}"
 
-          python3 scripts/organize_wp_media.py --output-dir "${OUTPUT_DIR}" --latest-20 --no-download --skip-posts --timeout 30 --retries 1 > "${OUTPUT_DIR}/run.stdout.log" 2> "${OUTPUT_DIR}/run.stderr.log"
+          python3 scripts/organize_wp_media.py --output-dir "${OUTPUT_DIR}" --latest-20 --skip-posts --timeout 30 --retries 1 > "${OUTPUT_DIR}/run.stdout.log" 2> "${OUTPUT_DIR}/run.stderr.log"
           status=$?
 
           if [ -s "${OUTPUT_DIR}/run.stdout.log" ]; then
@@ -105,7 +105,7 @@ jobs:
           if len(rows) > 20:
               raise SystemExit(f"Expected at most 20 media rows, got {len(rows)}")
 
-          required_columns = ["filename", "title", "alt", "category", "possible_article", "upload_date", "image_url"]
+          required_columns = ["filename", "title", "alt", "category", "possible_article", "upload_date", "image_url", "local_path"]
           if fieldnames != required_columns:
               raise SystemExit(f"Unexpected image-index.csv columns: {fieldnames}")
 
@@ -129,6 +129,14 @@ jobs:
           summary = json.loads(summary_path.read_text(encoding="utf-8"))
           if summary.get("media_count") != len(rows):
               raise SystemExit(f"Summary media_count {summary.get('media_count')} does not match CSV rows {len(rows)}")
+          local_paths = [row.get("local_path", "") for row in rows if row.get("local_path")]
+          if len(local_paths) != summary.get("thumbnail_saved_count"):
+              raise SystemExit(f"Summary thumbnail_saved_count {summary.get('thumbnail_saved_count')} does not match local_path count {len(local_paths)}")
+          for local_path in local_paths:
+              if not local_path.startswith("thumbnails/"):
+                  raise SystemExit(f"local_path must be under thumbnails/: {local_path}")
+              if not (output / local_path).is_file():
+                  raise SystemExit(f"local_path file does not exist: {local_path}")
           methods_used = set(summary.get("methods_used", []))
           if methods_used - {"GET"}:
               raise SystemExit(f"Forbidden methods in summary: {sorted(methods_used - {'GET'})}")
@@ -143,7 +151,7 @@ jobs:
           if summary.get("group_count") != len(group_rows):
               raise SystemExit(f"Summary group_count {summary.get('group_count')} does not match group CSV rows {len(group_rows)}")
 
-          print(f"OK: image-index.csv rows={len(rows)}, image-groups.csv rows={len(group_rows)}, WordPress methods={sorted(methods) or ['GET']}, latest query verified")
+          print(f"OK: image-index.csv rows={len(rows)}, thumbnails={summary.get('thumbnail_saved_count')}, image-groups.csv rows={len(group_rows)}, WordPress methods={sorted(methods) or ['GET']}, latest query verified")
           PY
 
       - name: Write AI inference report
@@ -179,6 +187,7 @@ jobs:
               f"- 取得件数: {len(rows)} 件",
               f"- Summary media_count: {summary.get('media_count')} 件",
               f"- 類似画像グループ数: {summary.get('group_count')} 件",
+              f"- サムネイル保存件数: {summary.get('thumbnail_saved_count', 0)} 件",
               "",
               "## 2. image-index.csv サンプル5件",
               "",
@@ -213,7 +222,7 @@ jobs:
               "",
               "## 5. 次段階の提案",
               "- CSVを確認し、`unknown` または意図と違うカテゴリのキーワードを追加する。",
-              "- 必要に応じて `--no-download` を外した画像保存テストに進み、サムネイル確認と重複ハッシュ検出を行う。",
+              "- 保存済みの `thumbnails/` を確認し、分類キーワードや重複ハッシュ検出を調整する。",
               "- 記事テーマ別に `possible_article` の候補名を調整し、将来の『記事テーマ → 関連画像候補』表示に使える辞書を育てる。",
               "",
               "## 確認結果",
@@ -256,6 +265,7 @@ jobs:
               "### 優先カテゴリ別ヒット状況",
               "## 4. possible_article サンプル",
               "## 5. 次段階の提案",
+              "サムネイル保存件数",
               "## 安全確認",
               "muv/tunnel",
               "muv/food",
@@ -321,7 +331,7 @@ jobs:
               "",
               "## 安全確認",
               "",
-              "この workflow は `scripts/organize_wp_media.py --latest-20 --no-download --skip-posts` だけを実行します。投稿作成、記事更新、メディア削除、POST/PUT/DELETE は行いません。",
+              "この workflow は `scripts/organize_wp_media.py --latest-20 --skip-posts` だけを実行します。投稿作成、記事更新、メディア削除、POST/PUT/DELETE は行いません。",
               "",
               "## media-organizer-summary.json",
               "",
@@ -363,6 +373,7 @@ jobs:
             ${{ env.OUTPUT_DIR }}/media-organizer-summary.json
             ${{ env.OUTPUT_DIR }}/media-organizer-run-log.csv
             ${{ env.OUTPUT_DIR }}/ai-inference-report.md
+            ${{ env.OUTPUT_DIR }}/thumbnails/**
             ${{ env.OUTPUT_DIR }}/failure-diagnosis.md
             ${{ env.OUTPUT_DIR }}/run.stdout.log
             ${{ env.OUTPUT_DIR }}/run.stderr.log
