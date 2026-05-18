@@ -18,6 +18,8 @@ DEFAULT_AI_IMAGE_LIMIT = 100
 DEFAULT_OPENAI_MODEL = "gpt-5-mini"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 
+# Future extension plan: keep category/ai_category stable for now, then add
+# main_category and sub_tags columns when multi-tag article-topic grouping starts.
 AI_CATEGORIES = [
     "car/lexus",
     "car/tanto",
@@ -68,22 +70,22 @@ def guess_category(text):
 
 def guess_article(category):
     mapping = {
-        "car/lexus": "レクサスUX関連記事",
-        "car/tanto": "タント関連記事",
-        "genre/car": "車関連記事",
-        "genre/fishing": "釣り体験記事",
-        "genre/leisure": "レジャー関連記事",
-        "genre/travel": "旅行関連記事",
-        "genre/gourmet": "グルメ関連記事",
-        "location/hiroshima": "広島関連記事",
-        "location/shimane": "島根関連記事",
-        "location/tottori": "鳥取関連記事",
-        "location/yamaguchi": "山口関連記事",
-        "location/fukuoka": "福岡関連記事",
-        "location/oita": "大分関連記事",
-        "location/awaji": "淡路関連記事",
-        "bird": "鳥・野鳥関連記事",
-        "aquarium": "水槽・魚展示関連記事",
+        "car/lexus": "レクサスUXドライブ記事候補",
+        "car/tanto": "タントおでかけ記事候補",
+        "genre/car": "車・ドライブ記事候補",
+        "genre/fishing": "釣り体験記事候補",
+        "genre/leisure": "レジャー・おでかけ記事候補",
+        "genre/travel": "旅行・観光記事候補",
+        "genre/gourmet": "グルメ記事候補",
+        "location/hiroshima": "広島観光まとめ候補",
+        "location/shimane": "島根旅行記事候補",
+        "location/tottori": "鳥取旅行記事候補",
+        "location/yamaguchi": "山口旅行記事候補",
+        "location/fukuoka": "福岡グルメ・観光記事候補",
+        "location/oita": "大分旅行記事候補",
+        "location/awaji": "淡路島おでかけ記事候補",
+        "bird": "鳥・野鳥観察記事候補",
+        "aquarium": "水族館記事候補",
         "unknown": "未分類記事候補",
     }
     return mapping.get(category, "未分類記事候補")
@@ -98,11 +100,16 @@ def safe_filename(value, fallback):
 
 def get_preferred_image_url(item):
     sizes = item.get("media_details", {}).get("sizes", {}) or {}
-    for size_name in ("thumbnail", "medium", "medium_large", "large"):
+    for size_name in ("medium_large", "medium", "large"):
         source_url = sizes.get(size_name, {}).get("source_url")
         if source_url:
             return source_url
-    return item.get("source_url", "")
+
+    source_url = item.get("source_url", "")
+    if source_url:
+        return source_url
+
+    return sizes.get("thumbnail", {}).get("source_url", "")
 
 
 def safe_url_for_request(url):
@@ -161,6 +168,76 @@ def fetch_url(request, timeout, retries):
     return "error", b"", last_error or "request failed"
 
 
+def get_image_dimensions(image_path):
+    try:
+        data = image_path.read_bytes()
+    except Exception:
+        return ""
+
+    if len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n"):
+        width = int.from_bytes(data[16:20], "big")
+        height = int.from_bytes(data[20:24], "big")
+        return f"{width}x{height}"
+
+    if len(data) >= 10 and data[:6] in {b"GIF87a", b"GIF89a"}:
+        width = int.from_bytes(data[6:8], "little")
+        height = int.from_bytes(data[8:10], "little")
+        return f"{width}x{height}"
+
+    if len(data) >= 4 and data[:2] == b"\xff\xd8":
+        offset = 2
+        while offset + 9 < len(data):
+            if data[offset] != 0xFF:
+                offset += 1
+                continue
+            marker = data[offset + 1]
+            offset += 2
+            if marker in {0xD8, 0xD9, 0x01} or 0xD0 <= marker <= 0xD7:
+                continue
+            if offset + 2 > len(data):
+                break
+            segment_length = int.from_bytes(data[offset:offset + 2], "big")
+            if segment_length < 2 or offset + segment_length > len(data):
+                break
+            if marker in {
+                0xC0,
+                0xC1,
+                0xC2,
+                0xC3,
+                0xC5,
+                0xC6,
+                0xC7,
+                0xC9,
+                0xCA,
+                0xCB,
+                0xCD,
+                0xCE,
+                0xCF,
+            }:
+                height = int.from_bytes(data[offset + 3:offset + 5], "big")
+                width = int.from_bytes(data[offset + 5:offset + 7], "big")
+                return f"{width}x{height}"
+            offset += segment_length
+
+    if len(data) >= 30 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        chunk_type = data[12:16]
+        if chunk_type == b"VP8X" and len(data) >= 30:
+            width = 1 + int.from_bytes(data[24:27], "little")
+            height = 1 + int.from_bytes(data[27:30], "little")
+            return f"{width}x{height}"
+        if chunk_type == b"VP8 " and len(data) >= 30:
+            width = int.from_bytes(data[26:28], "little") & 0x3FFF
+            height = int.from_bytes(data[28:30], "little") & 0x3FFF
+            return f"{width}x{height}"
+        if chunk_type == b"VP8L" and len(data) >= 25:
+            bits = int.from_bytes(data[21:25], "little")
+            width = (bits & 0x3FFF) + 1
+            height = ((bits >> 14) & 0x3FFF) + 1
+            return f"{width}x{height}"
+
+    return ""
+
+
 def image_file_to_data_url(image_path):
     mime_type, _ = mimetypes.guess_type(image_path.name)
     if not mime_type or not mime_type.startswith("image/"):
@@ -211,14 +288,18 @@ def classify_thumbnail_with_openai(image_path, model, api_key, timeout):
     categories = ", ".join(AI_CATEGORIES)
     prompt = (
         "You classify a small thumbnail for a Japanese life-log media database. "
-        "Choose exactly one category from this list: "
+        "Choose exactly one best category from this list: "
         f"{categories}. "
+        "Be proactive: estimate the closest category even from partial visual clues. "
+        "Use unknown only as a last resort when there are no useful visual clues at all. "
         "Prefer these mappings: torii/shrine/temple -> genre/travel; "
         "sea/beach/sand/outdoor play -> genre/leisure; "
         "Lexus car interior or Lexus vehicle -> car/lexus; Tanto vehicle -> car/tanto; "
         "fish/fishing rods/tackle/catch -> genre/fishing; food/restaurant/cafe -> genre/gourmet; "
-        "bird -> bird; aquarium/fish tank/exhibited fish -> aquarium. "
-        "If uncertain, use unknown. Return JSON only: "
+        "bird -> bird; aquarium/fish tank/exhibited fish -> aquarium; "
+        "deer/animals at tourist spots -> genre/travel unless bird is clearly the main subject. "
+        "When location-specific evidence is visible or strongly implied, choose the best location category. "
+        "Return JSON only: "
         '{"category":"...","reason":"short reason in Japanese"}'
     )
     payload = {
@@ -449,6 +530,7 @@ def main():
 
         local_path = ""
         thumbnail_path = None
+        ai_image_dimensions = ""
 
         if not args.no_download:
             thumb_url, saved_path, status, error = download_thumbnail(
@@ -463,6 +545,7 @@ def main():
             if saved_path:
                 thumbnail_path = Path(saved_path)
                 local_path = str(thumbnail_path.relative_to(output_dir))
+                ai_image_dimensions = get_image_dimensions(thumbnail_path)
                 thumbnail_saved_count += 1
             else:
                 thumbnail_error_count += 1
@@ -501,6 +584,7 @@ def main():
                     "local_path": local_path,
                     "text_category": text_category,
                     "ai_category": ai_category or "unknown",
+                    "ai_image_dimensions": ai_image_dimensions,
                     "final_category": category,
                     "ai_status": ai_status,
                     "ai_reason": ai_reason,
@@ -593,6 +677,7 @@ def main():
                 "local_path",
                 "text_category",
                 "ai_category",
+                "ai_image_dimensions",
                 "final_category",
                 "ai_status",
                 "ai_reason",
