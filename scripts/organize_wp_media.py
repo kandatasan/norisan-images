@@ -5,8 +5,11 @@ import base64
 import csv
 import json
 import os
+import re
+import time
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.error import HTTPError, URLError
+from urllib.parse import unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -35,6 +38,68 @@ def guess_article(category):
     return mapping.get(category, "未分類記事候補")
 
 
+def safe_filename(value, fallback):
+    name = unquote((value or "").split("?", 1)[0].split("#", 1)[0])
+    name = Path(name).name or fallback
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
+    return name or fallback
+
+
+def get_preferred_image_url(item):
+    sizes = item.get("media_details", {}).get("sizes", {}) or {}
+    for size_name in ("thumbnail", "medium", "medium_large", "large"):
+        source_url = sizes.get(size_name, {}).get("source_url")
+        if source_url:
+            return source_url
+    return item.get("source_url", "")
+
+
+def build_request(url, token=None, wp_url=None):
+    request = Request(url, method="GET")
+    if token and wp_url:
+        if urlparse(url).netloc == urlparse(wp_url).netloc:
+            request.add_header("Authorization", f"Basic {token}")
+    return request
+
+
+def fetch_url(request, timeout, retries):
+    attempts = max(1, retries + 1)
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                return response.status, response.read(), None
+        except HTTPError as error:
+            return error.code, error.read(), str(error)
+        except URLError as error:
+            last_error = str(error)
+        except TimeoutError as error:
+            last_error = str(error)
+
+        if attempt < attempts:
+            time.sleep(min(2 ** (attempt - 1), 5))
+
+    return "error", b"", last_error or "request failed"
+
+
+def download_thumbnail(item, idx, thumbnails_dir, token, wp_url, timeout, retries):
+    image_url = get_preferred_image_url(item)
+    if not image_url:
+        return "", "", "missing_url", "No image URL found"
+
+    media_id = item.get("id") or idx
+    filename = safe_filename(urlparse(image_url).path, f"media-{media_id}.jpg")
+    local_path = thumbnails_dir / f"{idx:03d}-{media_id}-{filename}"
+
+    request = build_request(image_url, token=token, wp_url=wp_url)
+    status, body, error = fetch_url(request, timeout=timeout, retries=retries)
+    if error or status != 200:
+        return image_url, "", str(status), error or f"HTTP {status}"
+
+    local_path.write_bytes(body)
+    return image_url, local_path.as_posix(), str(status), ""
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", required=True)
@@ -48,6 +113,9 @@ def main():
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    thumbnails_dir = output_dir / "thumbnails"
+    if not args.no_download:
+        thumbnails_dir.mkdir(parents=True, exist_ok=True)
 
     wp_url = os.environ["WP_URL"].rstrip("/")
     wp_user = os.environ["WP_USER"]
@@ -69,7 +137,7 @@ def main():
         f"{wp_user}:{wp_password}".encode()
     ).decode()
 
-    request = Request(api_url)
+    request = Request(api_url, method="GET")
     request.add_header("Authorization", f"Basic {token}")
 
     with urlopen(request, timeout=args.timeout) as response:
@@ -78,6 +146,8 @@ def main():
     image_rows = []
     group_rows = []
     run_log_rows = []
+    thumbnail_saved_count = 0
+    thumbnail_error_count = 0
 
     run_log_rows.append(
         {
@@ -97,13 +167,37 @@ def main():
         alt = item.get("alt_text", "")
         source_url = item.get("source_url", "")
 
-        filename = source_url.split("/")[-1]
+        filename = safe_filename(urlparse(source_url).path, f"media-{item.get('id') or idx}")
 
         category = guess_category(
             f"{title} {alt} {filename}"
         )
 
         possible_article = guess_article(category)
+        local_path = ""
+
+        if not args.no_download:
+            thumb_url, saved_path, status, error = download_thumbnail(
+                item,
+                idx,
+                thumbnails_dir,
+                token,
+                wp_url,
+                args.timeout,
+                args.retries,
+            )
+            if saved_path:
+                local_path = str(Path(saved_path).relative_to(output_dir))
+                thumbnail_saved_count += 1
+            else:
+                thumbnail_error_count += 1
+            run_log_rows.append(
+                {
+                    "method": "GET",
+                    "url": thumb_url,
+                    "status": status if not error else f"{status}: {error}",
+                }
+            )
 
         image_rows.append(
             {
@@ -114,6 +208,7 @@ def main():
                 "possible_article": possible_article,
                 "upload_date": item.get("date", ""),
                 "image_url": source_url,
+                "local_path": local_path,
             }
         )
 
@@ -144,6 +239,7 @@ def main():
                 "possible_article",
                 "upload_date",
                 "image_url",
+                "local_path",
             ],
         )
         writer.writeheader()
@@ -190,6 +286,8 @@ def main():
     summary = {
         "media_count": len(image_rows),
         "group_count": len(group_rows),
+        "thumbnail_saved_count": thumbnail_saved_count,
+        "thumbnail_error_count": thumbnail_error_count,
         "methods_used": ["GET"],
         "status": "success",
     }
@@ -202,7 +300,8 @@ def main():
     )
 
     print(
-        f"Exported {len(image_rows)} images successfully."
+        f"Exported {len(image_rows)} images successfully. "
+        f"Saved {thumbnail_saved_count} thumbnails."
     )
 
 
