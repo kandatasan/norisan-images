@@ -20,7 +20,6 @@ MAX_REST_PER_PAGE = 100
 DEFAULT_AI_IMAGE_LIMIT = 100
 DEFAULT_OPENAI_MODEL = "gpt-5-mini"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
-
 # Future extension plan: keep category/ai_category stable for now, then add
 # main_category and sub_tags columns when multi-tag article-topic grouping starts.
 AI_CATEGORIES = [
@@ -41,6 +40,24 @@ AI_CATEGORIES = [
     "aquarium",
     "unknown",
 ]
+
+
+def openai_response_format():
+    return {
+        "type": "json_schema",
+        "name": "wp_media_ai_category",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "category": {"type": "string", "enum": AI_CATEGORIES},
+                "reason": {"type": "string"},
+            },
+            "required": ["category", "reason"],
+        },
+    }
+
 
 
 CATEGORY_RULES = [
@@ -348,6 +365,37 @@ def strip_markdown_json_fence(response_text):
     return cleaned, "plain_text"
 
 
+def extract_openai_error_message(error_body):
+    if not error_body:
+        return ""
+    try:
+        parsed = json.loads(error_body)
+    except json.JSONDecodeError:
+        return error_body.strip().splitlines()[0][:500]
+
+    error = parsed.get("error") if isinstance(parsed, dict) else None
+    if isinstance(error, dict):
+        message = str(error.get("message", "")).strip()
+        code = str(error.get("code", "")).strip()
+        error_type = str(error.get("type", "")).strip()
+        details = [part for part in [message, error_type, code] if part]
+        return " | ".join(details)[:500]
+
+    message = str(parsed.get("message", "")).strip() if isinstance(parsed, dict) else ""
+    return (message or error_body.strip().splitlines()[0])[:500]
+
+
+def redact_openai_debug_payload(payload):
+    redacted = json.loads(json.dumps(payload))
+    for item in redacted.get("input", []):
+        for content in item.get("content", []):
+            if content.get("type") == "input_image" and content.get("image_url", "").startswith("data:"):
+                image_url = content["image_url"]
+                prefix = image_url.split(",", 1)[0]
+                content["image_url"] = f"{prefix},<base64 omitted; {len(image_url)} chars>"
+    return redacted
+
+
 def parse_ai_category_response(response_text):
     cleaned, parse_status = strip_markdown_json_fence(response_text)
     parsed = None
@@ -417,11 +465,13 @@ def classify_thumbnail_with_openai(image_path, model, api_key, timeout):
                 ],
             }
         ],
+        "text": {"format": openai_response_format()},
         "max_output_tokens": 200,
     }
+    request_payload = json.dumps(payload).encode("utf-8")
     request = Request(
         OPENAI_RESPONSES_URL,
-        data=json.dumps(payload).encode("utf-8"),
+        data=request_payload,
         headers={
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -430,13 +480,36 @@ def classify_thumbnail_with_openai(image_path, model, api_key, timeout):
     )
 
     with urlopen(request, timeout=timeout) as response:
-        response_data = json.loads(response.read().decode("utf-8"))
+        http_status = response.status
+        response_body = response.read().decode("utf-8")
+        response_data = json.loads(response_body)
+
+    error_obj = response_data.get("error") if isinstance(response_data, dict) else None
+    if isinstance(error_obj, dict):
+        openai_error_message = extract_openai_error_message(json.dumps({"error": error_obj}, ensure_ascii=False))
+        debug_data = {
+            "endpoint": OPENAI_RESPONSES_URL,
+            "model": model,
+            "image": image_path.name,
+            "timeout_seconds": timeout,
+            "http_status": http_status,
+            "authorization_header": "Bearer <redacted>" if api_key else "",
+            "request_payload": redact_openai_debug_payload(payload),
+            "openai_error_message": openai_error_message,
+            "raw_response": response_data,
+        }
+        return "unknown", openai_error_message or "OpenAI response contained an error", "response_error", openai_error_message, "", debug_data, http_status, openai_error_message
 
     response_text = extract_response_text(response_data)
     category, reason, parse_status, parse_error = parse_ai_category_response(response_text)
     debug_data = {
+        "endpoint": OPENAI_RESPONSES_URL,
         "model": model,
         "image": image_path.name,
+        "timeout_seconds": timeout,
+        "http_status": http_status,
+        "authorization_header": "Bearer <redacted>" if api_key else "",
+        "request_payload": redact_openai_debug_payload(payload),
         "response_text": response_text,
         "parse_status": parse_status,
         "parse_error": parse_error,
@@ -444,34 +517,53 @@ def classify_thumbnail_with_openai(image_path, model, api_key, timeout):
         "parsed_reason": reason,
         "raw_response": response_data,
     }
-    return category, reason, parse_status, parse_error, response_text, debug_data
+    return category, reason, parse_status, parse_error, response_text, debug_data, http_status, ""
 
 
 def maybe_classify_thumbnail(image_path, model, api_key, timeout):
     if not api_key:
-        return "unknown", "OPENAI_API_KEY is not set", "skipped", "", "", "", {}
+        return "unknown", "OPENAI_API_KEY is not set", "skipped", "", "", "", {}, "", ""
     if not image_path or not image_path.is_file():
-        return "unknown", "thumbnail file is missing", "skipped", "", "", "", {}
+        return "unknown", "thumbnail file is missing", "skipped", "", "", "", {}, "", ""
 
     try:
-        category, reason, parse_status, parse_error, response_text, debug_data = classify_thumbnail_with_openai(image_path, model, api_key, timeout)
+        (
+            category,
+            reason,
+            parse_status,
+            parse_error,
+            response_text,
+            debug_data,
+            http_status,
+            openai_error_message,
+        ) = classify_thumbnail_with_openai(image_path, model, api_key, timeout)
     except HTTPError as error:
-        error_body = error.read().decode("utf-8", errors="replace")[:1000]
+        error_body = error.read().decode("utf-8", errors="replace")
+        openai_error_message = extract_openai_error_message(error_body)
         debug_data = {
+            "endpoint": OPENAI_RESPONSES_URL,
             "model": model,
             "image": image_path.name,
+            "timeout_seconds": timeout,
             "http_status": error.code,
-            "error_body": error_body,
+            "authorization_header": "Bearer <redacted>" if api_key else "",
+            "openai_error_message": openai_error_message,
+            "raw_error_response": error_body,
         }
-        return "unknown", f"OpenAI HTTP {error.code}: {error_body[:300]}", "error", "http_error", error_body, "", debug_data
+        reason = f"OpenAI HTTP {error.code}: {openai_error_message or error_body[:300]}"
+        return "unknown", reason[:500], "error", "http_error", error_body, "", debug_data, str(error.code), openai_error_message
     except URLError as error:
-        return "unknown", f"OpenAI URL error: {error}", "error", "url_error", str(error), "", {}
+        message = str(error)
+        return "unknown", f"OpenAI URL error: {message}", "error", "url_error", message, "", {}, "", message
     except TimeoutError as error:
-        return "unknown", f"OpenAI timeout: {error}", "error", "timeout", str(error), "", {}
+        message = str(error)
+        return "unknown", f"OpenAI timeout after {timeout}s: {message}", "error", "timeout", message, "", {}, "", message
     except Exception as error:
-        return "unknown", f"OpenAI error: {type(error).__name__}: {error}", "error", "exception", str(error), "", {}
+        message = f"{type(error).__name__}: {error}"
+        return "unknown", f"OpenAI error: {message}", "error", "exception", message, "", {}, "", message
 
-    return category, reason, "classified", parse_status, parse_error, response_text, debug_data
+    ai_status = "error" if parse_status == "response_error" else "classified"
+    return category, reason, ai_status, parse_status, parse_error, response_text, debug_data, str(http_status), openai_error_message
 
 
 def write_ai_debug_json(debug_dir, idx, filename, debug_data):
@@ -642,6 +734,9 @@ def main():
     ai_classified_count = 0
     ai_reclassified_count = 0
     ai_error_count = 0
+    ai_http_status_counts = {}
+    ai_last_http_status = ""
+    ai_last_error_message = ""
     openai_api_key = os.environ.get("OPENAI_API_KEY", "")
     ai_candidate_indexes = set()
     if args.ai_classify and args.ai_limit > 0:
@@ -697,6 +792,8 @@ def main():
         ai_parse_error = ""
         ai_response_text = ""
         ai_debug_path = ""
+        ai_http_status = ""
+        ai_openai_error_message = ""
 
         local_path = ""
         thumbnail_path = None
@@ -745,6 +842,8 @@ def main():
                     ai_parse_error,
                     ai_response_text,
                     ai_debug_data,
+                    ai_http_status,
+                    ai_openai_error_message,
                 ) = maybe_classify_thumbnail(
                     thumbnail_path,
                     args.ai_model,
@@ -754,6 +853,11 @@ def main():
                 ai_debug_name = write_ai_debug_json(ai_debug_dir, idx, filename, ai_debug_data)
                 ai_debug_path = f"ai-debug/{ai_debug_name}" if ai_debug_name else ""
                 ai_classified_count += 1
+                if ai_http_status:
+                    ai_http_status_counts[ai_http_status] = ai_http_status_counts.get(ai_http_status, 0) + 1
+                    ai_last_http_status = ai_http_status
+                if ai_openai_error_message:
+                    ai_last_error_message = ai_openai_error_message
                 if ai_status == "error":
                     ai_error_count += 1
                 if ai_category != "unknown":
@@ -782,6 +886,8 @@ def main():
                     "ai_parse_status": ai_parse_status,
                     "ai_parse_error": ai_parse_error,
                     "ai_response_text": ai_response_text[:1000],
+                    "ai_http_status": ai_http_status,
+                    "ai_openai_error_message": ai_openai_error_message,
                     "ai_debug_path": ai_debug_path,
                 }
             )
@@ -893,6 +999,8 @@ def main():
                 "ai_parse_status",
                 "ai_parse_error",
                 "ai_response_text",
+                "ai_http_status",
+                "ai_openai_error_message",
                 "ai_debug_path",
             ],
         )
@@ -934,6 +1042,9 @@ def main():
         "ai_classified_count": ai_classified_count,
         "ai_reclassified_count": ai_reclassified_count,
         "ai_error_count": ai_error_count,
+        "ai_http_status_counts": ai_http_status_counts,
+        "ai_last_http_status": ai_last_http_status,
+        "ai_last_error_message": ai_last_error_message,
         "ai_preview_count": len(ai_preview_rows),
         "ai_debug_count": len(list(ai_debug_dir.glob("*.json"))) if args.ai_classify and ai_debug_dir.exists() else 0,
         "methods_used": ["GET"],
