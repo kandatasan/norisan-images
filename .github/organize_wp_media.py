@@ -3,10 +3,13 @@
 import argparse
 import base64
 import csv
+import html
 import json
 import mimetypes
 import os
+import random
 import re
+import shutil
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -96,6 +99,73 @@ def safe_filename(value, fallback):
     name = Path(name).name or fallback
     name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
     return name or fallback
+
+
+def split_image_dimensions(dimensions):
+    if not dimensions or "x" not in dimensions:
+        return "", ""
+    width, height = dimensions.split("x", 1)
+    return width, height
+
+
+def copy_ai_preview_image(thumbnail_path, preview_dir, idx, filename):
+    if not thumbnail_path or not thumbnail_path.is_file():
+        return ""
+
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    preview_name = f"{idx:03d}-{safe_filename(filename, f'ai-preview-{idx}.jpg')}"
+    preview_path = preview_dir / preview_name
+    try:
+        shutil.copy2(thumbnail_path, preview_path)
+    except Exception:
+        return ""
+    return preview_path.name
+
+
+def write_ai_preview_index(preview_dir, preview_rows):
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "<!doctype html>",
+        '<html lang="ja">',
+        "<head>",
+        '  <meta charset="utf-8">',
+        "  <title>AI分類対象プレビュー</title>",
+        "  <style>",
+        "    body { font-family: sans-serif; margin: 24px; }",
+        "    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 16px; }",
+        "    .card { border: 1px solid #ddd; border-radius: 8px; padding: 8px; background: #fff; }",
+        "    img { max-width: 100%; height: auto; display: block; margin-bottom: 8px; }",
+        "    .meta { font-size: 12px; overflow-wrap: anywhere; }",
+        "  </style>",
+        "</head>",
+        "<body>",
+        "  <h1>AI分類対象プレビュー</h1>",
+        f"  <p>AI分類対象画像: {len(preview_rows)} 件</p>",
+        '  <div class="grid">',
+    ]
+    for row in preview_rows:
+        preview_name = html.escape(row.get("preview_name", ""))
+        filename = html.escape(row.get("filename", ""))
+        dimensions = html.escape(row.get("ai_image_dimensions", ""))
+        ai_category = html.escape(row.get("ai_category", ""))
+        ai_status = html.escape(row.get("ai_status", ""))
+        ai_reason = html.escape(row.get("ai_reason", ""))
+        lines.extend(
+            [
+                '    <div class="card">',
+                f'      <img src="{preview_name}" alt="{filename}">',
+                '      <div class="meta">',
+                f"        <strong>{filename}</strong><br>",
+                f"        size: {dimensions}<br>",
+                f"        category: {ai_category}<br>",
+                f"        status: {ai_status}<br>",
+                f"        reason: {ai_reason}",
+                "      </div>",
+                "    </div>",
+            ]
+        )
+    lines.extend(["  </div>", "</body>", "</html>"])
+    (preview_dir / "index.html").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def get_preferred_image_url(item):
@@ -507,6 +577,34 @@ def main():
     ai_reclassified_count = 0
     ai_error_count = 0
     openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+    ai_candidate_indexes = set()
+    if args.ai_classify and args.ai_limit > 0:
+        unknown_candidate_indexes = []
+        for candidate_idx, candidate_item in enumerate(data, start=1):
+            candidate_title = (
+                candidate_item.get("title", {})
+                .get("rendered", "")
+                .strip()
+            )
+            candidate_alt = candidate_item.get("alt_text", "")
+            candidate_source_url = candidate_item.get("source_url", "")
+            candidate_filename = safe_filename(
+                urlparse(candidate_source_url).path,
+                f"media-{candidate_item.get('id') or candidate_idx}",
+            )
+            candidate_category = guess_category(
+                f"{candidate_title} {candidate_alt} {candidate_filename} {candidate_source_url}"
+            )
+            if candidate_category == "unknown":
+                unknown_candidate_indexes.append(candidate_idx)
+
+        sample_count = min(args.ai_limit, len(unknown_candidate_indexes))
+        ai_candidate_indexes = set(random.sample(unknown_candidate_indexes, sample_count))
+
+    ai_preview_dir = output_dir / "ai-preview"
+    ai_preview_rows = []
+    if args.ai_classify:
+        ai_preview_dir.mkdir(parents=True, exist_ok=True)
 
     for idx, item in enumerate(data, start=1):
         title = (
@@ -558,8 +656,15 @@ def main():
                 }
             )
 
+        preview_name = ""
         if args.ai_classify and text_category == "unknown":
-            if ai_classified_count < args.ai_limit:
+            if idx in ai_candidate_indexes:
+                preview_name = copy_ai_preview_image(
+                    thumbnail_path,
+                    ai_preview_dir,
+                    idx,
+                    filename,
+                )
                 ai_category, ai_reason, ai_status = maybe_classify_thumbnail(
                     thumbnail_path,
                     args.ai_model,
@@ -574,22 +679,37 @@ def main():
                     ai_reclassified_count += 1
             else:
                 ai_category = "unknown"
-                ai_reason = "AI classification limit reached"
+                ai_reason = "not selected for random AI sample"
                 ai_status = "skipped"
 
         if args.ai_classify:
+            width, height = split_image_dimensions(ai_image_dimensions)
             ai_log_rows.append(
                 {
                     "filename": filename,
-                    "local_path": local_path,
-                    "text_category": text_category,
+                    "width": width,
+                    "height": height,
                     "ai_category": ai_category or "unknown",
+                    "ai_reason": ai_reason,
+                    "local_path": local_path,
+                    "preview_path": f"ai-preview/{preview_name}" if preview_name else "",
+                    "text_category": text_category,
                     "ai_image_dimensions": ai_image_dimensions,
                     "final_category": category,
                     "ai_status": ai_status,
-                    "ai_reason": ai_reason,
                 }
             )
+            if preview_name:
+                ai_preview_rows.append(
+                    {
+                        "filename": filename,
+                        "preview_name": preview_name,
+                        "ai_image_dimensions": ai_image_dimensions,
+                        "ai_category": ai_category or "unknown",
+                        "ai_status": ai_status,
+                        "ai_reason": ai_reason,
+                    }
+                )
 
         possible_article = guess_article(category)
 
@@ -674,17 +794,23 @@ def main():
             f,
             fieldnames=[
                 "filename",
-                "local_path",
-                "text_category",
+                "width",
+                "height",
                 "ai_category",
+                "ai_reason",
+                "local_path",
+                "preview_path",
+                "text_category",
                 "ai_image_dimensions",
                 "final_category",
                 "ai_status",
-                "ai_reason",
             ],
         )
         writer.writeheader()
         writer.writerows(ai_log_rows)
+
+    if args.ai_classify:
+        write_ai_preview_index(ai_preview_dir, ai_preview_rows)
 
     run_log_csv = output_dir / "media-organizer-run-log.csv"
 
@@ -718,6 +844,7 @@ def main():
         "ai_classified_count": ai_classified_count,
         "ai_reclassified_count": ai_reclassified_count,
         "ai_error_count": ai_error_count,
+        "ai_preview_count": len(ai_preview_rows),
         "methods_used": ["GET"],
         "status": "success",
     }
