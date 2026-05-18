@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+
+import argparse
+import base64
+import csv
+import json
+import os
+import re
+import time
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import unquote, urlencode, urlparse
+from urllib.request import Request, urlopen
+
+
+def guess_category(text):
+    text = (text or "").lower()
+
+    if "ux" in text or "lexus" in text:
+        return "lexus/interior"
+
+    if "muv" in text:
+        return "muv/exterior"
+
+    if "fish" in text or "釣" in text:
+        return "tsurikue/fishing"
+
+    return "unknown"
+
+
+def guess_article(category):
+    mapping = {
+        "lexus/interior": "レクサスUX内装レビュー",
+        "muv/exterior": "ムーバレー体験記事",
+        "tsurikue/fishing": "釣り体験記事",
+        "unknown": "未分類記事候補",
+    }
+    return mapping.get(category, "未分類記事候補")
+
+
+def safe_filename(value, fallback):
+    name = unquote((value or "").split("?", 1)[0].split("#", 1)[0])
+    name = Path(name).name or fallback
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
+    return name or fallback
+
+
+def get_preferred_image_url(item):
+    sizes = item.get("media_details", {}).get("sizes", {}) or {}
+    for size_name in ("thumbnail", "medium", "medium_large", "large"):
+        source_url = sizes.get(size_name, {}).get("source_url")
+        if source_url:
+            return source_url
+    return item.get("source_url", "")
+
+
+def build_request(url, token=None, wp_url=None):
+    request = Request(url, method="GET")
+    if token and wp_url:
+        if urlparse(url).netloc == urlparse(wp_url).netloc:
+            request.add_header("Authorization", f"Basic {token}")
+    return request
+
+
+def fetch_url(request, timeout, retries):
+    attempts = max(1, retries + 1)
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                return response.status, response.read(), None
+        except HTTPError as error:
+            return error.code, error.read(), str(error)
+        except URLError as error:
+            last_error = str(error)
+        except TimeoutError as error:
+            last_error = str(error)
+
+        if attempt < attempts:
+            time.sleep(min(2 ** (attempt - 1), 5))
+
+    return "error", b"", last_error or "request failed"
+
+
+def download_thumbnail(item, idx, thumbnails_dir, token, wp_url, timeout, retries):
+    image_url = get_preferred_image_url(item)
+    if not image_url:
+        return "", "", "missing_url", "No image URL found"
+
+    media_id = item.get("id") or idx
+    filename = safe_filename(urlparse(image_url).path, f"media-{media_id}.jpg")
+    local_path = thumbnails_dir / f"{idx:03d}-{media_id}-{filename}"
+
+    request = build_request(image_url, token=token, wp_url=wp_url)
+    status, body, error = fetch_url(request, timeout=timeout, retries=retries)
+    if error or status != 200:
+        return image_url, "", str(status), error or f"HTTP {status}"
+
+    local_path.write_bytes(body)
+    return image_url, local_path.as_posix(), str(status), ""
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--latest-20", action="store_true")
+    parser.add_argument("--no-download", action="store_true")
+    parser.add_argument("--skip-posts", action="store_true")
+    parser.add_argument("--timeout", type=int, default=30)
+    parser.add_argument("--retries", type=int, default=1)
+
+    args = parser.parse_args()
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    thumbnails_dir = output_dir / "thumbnails"
+    if not args.no_download:
+        thumbnails_dir.mkdir(parents=True, exist_ok=True)
+
+    wp_url = os.environ["WP_URL"].rstrip("/")
+    wp_user = os.environ["WP_USER"]
+    wp_password = os.environ["WP_APP_PASSWORD"]
+
+    api_url = (
+        f"{wp_url}/wp-json/wp/v2/media?"
+        + urlencode(
+            {
+                "per_page": 20,
+                "orderby": "date",
+                "order": "desc",
+                "media_type": "image",
+            }
+        )
+    )
+
+    token = base64.b64encode(
+        f"{wp_user}:{wp_password}".encode()
+    ).decode()
+
+    request = Request(api_url, method="GET")
+    request.add_header("Authorization", f"Basic {token}")
+
+    with urlopen(request, timeout=args.timeout) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    image_rows = []
+    group_rows = []
+    run_log_rows = []
+    thumbnail_saved_count = 0
+    thumbnail_error_count = 0
+
+    run_log_rows.append(
+        {
+            "method": "GET",
+            "url": api_url,
+            "status": "200",
+        }
+    )
+
+    for idx, item in enumerate(data, start=1):
+        title = (
+            item.get("title", {})
+            .get("rendered", "")
+            .strip()
+        )
+
+        alt = item.get("alt_text", "")
+        source_url = item.get("source_url", "")
+
+        filename = safe_filename(urlparse(source_url).path, f"media-{item.get('id') or idx}")
+
+        category = guess_category(
+            f"{title} {alt} {filename}"
+        )
+
+        possible_article = guess_article(category)
+        local_path = ""
+
+        if not args.no_download:
+            thumb_url, saved_path, status, error = download_thumbnail(
+                item,
+                idx,
+                thumbnails_dir,
+                token,
+                wp_url,
+                args.timeout,
+                args.retries,
+            )
+            if saved_path:
+                local_path = str(Path(saved_path).relative_to(output_dir))
+                thumbnail_saved_count += 1
+            else:
+                thumbnail_error_count += 1
+            run_log_rows.append(
+                {
+                    "method": "GET",
+                    "url": thumb_url,
+                    "status": status if not error else f"{status}: {error}",
+                }
+            )
+
+        image_rows.append(
+            {
+                "filename": filename,
+                "title": title,
+                "alt": alt,
+                "category": category,
+                "possible_article": possible_article,
+                "upload_date": item.get("date", ""),
+                "image_url": source_url,
+                "local_path": local_path,
+            }
+        )
+
+        group_rows.append(
+            {
+                "group_id": f"group-{idx}",
+                "match_type": "single",
+                "category": category,
+                "filenames": filename,
+                "image_urls": source_url,
+            }
+        )
+
+    index_csv = output_dir / "image-index.csv"
+
+    with index_csv.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "filename",
+                "title",
+                "alt",
+                "category",
+                "possible_article",
+                "upload_date",
+                "image_url",
+                "local_path",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(image_rows)
+
+    groups_csv = output_dir / "image-groups.csv"
+
+    with groups_csv.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "group_id",
+                "match_type",
+                "category",
+                "filenames",
+                "image_urls",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(group_rows)
+
+    run_log_csv = output_dir / "media-organizer-run-log.csv"
+
+    with run_log_csv.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "method",
+                "url",
+                "status",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(run_log_rows)
+
+    summary = {
+        "media_count": len(image_rows),
+        "group_count": len(group_rows),
+        "thumbnail_saved_count": thumbnail_saved_count,
+        "thumbnail_error_count": thumbnail_error_count,
+        "methods_used": ["GET"],
+        "status": "success",
+    }
+
+    summary_json = output_dir / "media-organizer-summary.json"
+
+    summary_json.write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    print(
+        f"Exported {len(image_rows)} images successfully. "
+        f"Saved {thumbnail_saved_count} thumbnails."
+    )
+
+
+if __name__ == "__main__":
+    main()
