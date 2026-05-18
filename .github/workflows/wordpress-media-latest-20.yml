@@ -1,20 +1,27 @@
-name: WordPress media latest 20 test
+name: WordPress media latest test
 
 on:
   workflow_dispatch:
+    inputs:
+      media_limit:
+        description: 'Number of latest media images to fetch. Try 20, 100, 300, 1000, or 2000 in stages.'
+        required: false
+        default: '20'
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   wp-media-test:
-    name: GET latest 20 WordPress media items
+    name: GET latest WordPress media items
     runs-on: ubuntu-latest
     env:
       WP_URL: ${{ secrets.WP_URL }}
       WP_USER: ${{ secrets.WP_USER }}
       WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
       OUTPUT_DIR: wp-media-test-output
+      MEDIA_LIMIT: ${{ inputs.media_limit || '20' }}
 
     steps:
       - name: Checkout repository
@@ -37,11 +44,15 @@ jobs:
               missing=1
             fi
           done
+          if ! [[ "${MEDIA_LIMIT}" =~ ^[0-9]+$ ]] || [ "${MEDIA_LIMIT}" -lt 1 ]; then
+            echo "::error title=Invalid media_limit::media_limit must be a positive integer. Suggested staged values: 20, 100, 300, 1000, 2000."
+            missing=1
+          fi
           if [ "${missing}" -ne 0 ]; then
             exit 2
           fi
 
-      - name: Run latest 20 media GET export
+      - name: Run latest media GET export
         id: export
         shell: bash
         run: |
@@ -49,7 +60,7 @@ jobs:
           echo "::add-mask::${WP_APP_PASSWORD}"
           mkdir -p "${OUTPUT_DIR}"
 
-          python3 scripts/organize_wp_media.py --output-dir "${OUTPUT_DIR}" --latest-20 --skip-posts --timeout 30 --retries 1 > "${OUTPUT_DIR}/run.stdout.log" 2> "${OUTPUT_DIR}/run.stderr.log"
+          python3 scripts/organize_wp_media.py --output-dir "${OUTPUT_DIR}" --latest-20 --limit "${MEDIA_LIMIT}" --skip-posts --timeout 30 --retries 1 > "${OUTPUT_DIR}/run.stdout.log" 2> "${OUTPUT_DIR}/run.stderr.log"
           status=$?
 
           if [ -s "${OUTPUT_DIR}/run.stdout.log" ]; then
@@ -79,7 +90,7 @@ jobs:
           python3 - <<'PY'
           import csv
           import json
-          import sys
+          import os
           from pathlib import Path
           from urllib.parse import parse_qs, urlparse
 
@@ -102,8 +113,9 @@ jobs:
               reader = csv.DictReader(file_obj)
               rows = list(reader)
               fieldnames = reader.fieldnames or []
-          if len(rows) > 20:
-              raise SystemExit(f"Expected at most 20 media rows, got {len(rows)}")
+          media_limit = int(os.environ["MEDIA_LIMIT"])
+          if len(rows) > media_limit:
+              raise SystemExit(f"Expected at most {media_limit} media rows, got {len(rows)}")
 
           required_columns = ["filename", "title", "alt", "category", "possible_article", "upload_date", "image_url", "local_path"]
           if fieldnames != required_columns:
@@ -119,14 +131,22 @@ jobs:
           media_requests = [row for row in log_rows if "/wp-json/wp/v2/media" in row.get("url", "")]
           if not media_requests:
               raise SystemExit("No WordPress media endpoint GET was recorded")
-          parsed = parse_qs(urlparse(media_requests[0]["url"]).query)
-          expected = {"per_page": "20", "orderby": "date", "order": "desc", "media_type": "image"}
-          for key, value in expected.items():
-              actual = parsed.get(key, [None])[0]
-              if actual != value:
-                  raise SystemExit(f"Expected media query {key}={value}, got {actual}")
+          for request_row in media_requests:
+              parsed = parse_qs(urlparse(request_row["url"]).query)
+              per_page = int(parsed.get("per_page", ["0"])[0])
+              if per_page < 1 or per_page > 100:
+                  raise SystemExit(f"Expected media query per_page between 1 and 100, got {per_page}")
+              expected = {"orderby": "date", "order": "desc", "media_type": "image"}
+              for key, value in expected.items():
+                  actual = parsed.get(key, [None])[0]
+                  if actual != value:
+                      raise SystemExit(f"Expected media query {key}={value}, got {actual}")
 
           summary = json.loads(summary_path.read_text(encoding="utf-8"))
+          if summary.get("requested_limit") != media_limit:
+              raise SystemExit(f"Summary requested_limit {summary.get('requested_limit')} does not match input {media_limit}")
+          if summary.get("fetched_count") != len(rows):
+              raise SystemExit(f"Summary fetched_count {summary.get('fetched_count')} does not match CSV rows {len(rows)}")
           if summary.get("media_count") != len(rows):
               raise SystemExit(f"Summary media_count {summary.get('media_count')} does not match CSV rows {len(rows)}")
           local_paths = [row.get("local_path", "") for row in rows if row.get("local_path")]
@@ -151,7 +171,7 @@ jobs:
           if summary.get("group_count") != len(group_rows):
               raise SystemExit(f"Summary group_count {summary.get('group_count')} does not match group CSV rows {len(group_rows)}")
 
-          print(f"OK: image-index.csv rows={len(rows)}, thumbnails={summary.get('thumbnail_saved_count')}, image-groups.csv rows={len(group_rows)}, WordPress methods={sorted(methods) or ['GET']}, latest query verified")
+          print(f"OK: requested_limit={media_limit}, image-index.csv rows={len(rows)}, thumbnails={summary.get('thumbnail_saved_count')}, image-groups.csv rows={len(group_rows)}, WordPress methods={sorted(methods) or ['GET']}, paginated query verified")
           PY
 
       - name: Write AI inference report
@@ -181,10 +201,12 @@ jobs:
           ]
 
           lines = [
-              "# WordPressメディア最新20件 AI推測レポート",
+              "# WordPressメディア最新取得 AI推測レポート",
               "",
               "## 1. 取得件数",
+              f"- リクエスト件数: {summary.get('requested_limit', len(rows))} 件",
               f"- 取得件数: {len(rows)} 件",
+              f"- Summary fetched_count: {summary.get('fetched_count', len(rows))} 件",
               f"- Summary media_count: {summary.get('media_count')} 件",
               f"- 類似画像グループ数: {summary.get('group_count')} 件",
               f"- サムネイル保存件数: {summary.get('thumbnail_saved_count', 0)} 件",
@@ -265,6 +287,8 @@ jobs:
               "### 優先カテゴリ別ヒット状況",
               "## 4. possible_article サンプル",
               "## 5. 次段階の提案",
+              "リクエスト件数",
+              "Summary fetched_count",
               "サムネイル保存件数",
               "## 安全確認",
               "muv/tunnel",
@@ -319,7 +343,7 @@ jobs:
               return text or "（空ファイル）"
 
           report_lines = [
-              "# WordPressメディア最新20件 失敗診断",
+              "# WordPressメディア最新取得 失敗診断",
               "",
               "## 想定される確認ポイント",
               "",
@@ -331,7 +355,7 @@ jobs:
               "",
               "## 安全確認",
               "",
-              "この workflow は `scripts/organize_wp_media.py --latest-20 --skip-posts` だけを実行します。投稿作成、記事更新、メディア削除、POST/PUT/DELETE は行いません。",
+              "この workflow は `scripts/organize_wp_media.py --latest-20 --limit <media_limit> --skip-posts` だけを実行します。投稿作成、記事更新、メディア削除、POST/PUT/DELETE は行いません。",
               "",
               "## media-organizer-summary.json",
               "",
