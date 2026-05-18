@@ -4,10 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       media_limit:
-        description: 'Number of latest media images to fetch. Try 20, 100, 300, 1000, or 2000 in stages.'
+        description: 'Number of latest media images to fetch.'
         required: false
-        default: '20'
-        type: string
+        default: '300'
+        type: choice
+        options:
+          - '300'
+          - '800'
+          - '1300'
+          - '2000'
+          - all
 
 permissions:
   contents: read
@@ -21,7 +27,7 @@ jobs:
       WP_USER: ${{ secrets.WP_USER }}
       WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
       OUTPUT_DIR: wp-media-test-output
-      MEDIA_LIMIT: ${{ inputs.media_limit || '20' }}
+      MEDIA_LIMIT: ${{ inputs.media_limit || '300' }}
 
     steps:
       - name: Checkout repository
@@ -44,10 +50,13 @@ jobs:
               missing=1
             fi
           done
-          if ! [[ "${MEDIA_LIMIT}" =~ ^[0-9]+$ ]] || [ "${MEDIA_LIMIT}" -lt 1 ]; then
-            echo "::error title=Invalid media_limit::media_limit must be a positive integer. Suggested staged values: 20, 100, 300, 1000, 2000."
-            missing=1
-          fi
+          case "${MEDIA_LIMIT}" in
+            300|800|1300|2000|all) ;;
+            *)
+              echo "::error title=Invalid media_limit::media_limit must be one of: 300, 800, 1300, 2000, all."
+              missing=1
+              ;;
+          esac
           if [ "${missing}" -ne 0 ]; then
             exit 2
           fi
@@ -113,9 +122,15 @@ jobs:
               reader = csv.DictReader(file_obj)
               rows = list(reader)
               fieldnames = reader.fieldnames or []
-          media_limit = int(os.environ["MEDIA_LIMIT"])
-          if len(rows) > media_limit:
-              raise SystemExit(f"Expected at most {media_limit} media rows, got {len(rows)}")
+          media_limit_input = os.environ["MEDIA_LIMIT"]
+          if media_limit_input == "all":
+              media_limit = None
+              expected_requested_limit = "all"
+          else:
+              media_limit = int(media_limit_input)
+              expected_requested_limit = media_limit
+              if len(rows) > media_limit:
+                  raise SystemExit(f"Expected at most {media_limit} media rows, got {len(rows)}")
 
           required_columns = ["filename", "title", "alt", "category", "possible_article", "upload_date", "image_url", "local_path"]
           if fieldnames != required_columns:
@@ -143,15 +158,19 @@ jobs:
                       raise SystemExit(f"Expected media query {key}={value}, got {actual}")
 
           summary = json.loads(summary_path.read_text(encoding="utf-8"))
-          if summary.get("requested_limit") != media_limit:
-              raise SystemExit(f"Summary requested_limit {summary.get('requested_limit')} does not match input {media_limit}")
+          if summary.get("requested_limit") != expected_requested_limit:
+              raise SystemExit(f"Summary requested_limit {summary.get('requested_limit')} does not match input {expected_requested_limit}")
           if summary.get("fetched_count") != len(rows):
               raise SystemExit(f"Summary fetched_count {summary.get('fetched_count')} does not match CSV rows {len(rows)}")
           if summary.get("media_count") != len(rows):
               raise SystemExit(f"Summary media_count {summary.get('media_count')} does not match CSV rows {len(rows)}")
           local_paths = [row.get("local_path", "") for row in rows if row.get("local_path")]
-          if len(local_paths) != summary.get("thumbnail_saved_count"):
-              raise SystemExit(f"Summary thumbnail_saved_count {summary.get('thumbnail_saved_count')} does not match local_path count {len(local_paths)}")
+          thumbnail_saved_count = summary.get("thumbnail_saved_count", 0)
+          thumbnail_error_count = summary.get("thumbnail_error_count", 0)
+          if len(local_paths) != thumbnail_saved_count:
+              raise SystemExit(f"Summary thumbnail_saved_count {thumbnail_saved_count} does not match local_path count {len(local_paths)}")
+          if thumbnail_saved_count + thumbnail_error_count != len(rows):
+              raise SystemExit(f"thumbnail_saved_count + thumbnail_error_count ({thumbnail_saved_count} + {thumbnail_error_count}) does not match CSV rows {len(rows)}")
           for local_path in local_paths:
               if not local_path.startswith("thumbnails/"):
                   raise SystemExit(f"local_path must be under thumbnails/: {local_path}")
@@ -171,7 +190,7 @@ jobs:
           if summary.get("group_count") != len(group_rows):
               raise SystemExit(f"Summary group_count {summary.get('group_count')} does not match group CSV rows {len(group_rows)}")
 
-          print(f"OK: requested_limit={media_limit}, image-index.csv rows={len(rows)}, thumbnails={summary.get('thumbnail_saved_count')}, image-groups.csv rows={len(group_rows)}, WordPress methods={sorted(methods) or ['GET']}, paginated query verified")
+          print(f"OK: requested_limit={expected_requested_limit}, image-index.csv rows={len(rows)}, thumbnails={summary.get('thumbnail_saved_count')}, thumbnail_errors={summary.get('thumbnail_error_count')}, image-groups.csv rows={len(group_rows)}, WordPress methods={sorted(methods) or ['GET']}, paginated query verified")
           PY
 
       - name: Write AI inference report
@@ -210,6 +229,7 @@ jobs:
               f"- Summary media_count: {summary.get('media_count')} 件",
               f"- 類似画像グループ数: {summary.get('group_count')} 件",
               f"- サムネイル保存件数: {summary.get('thumbnail_saved_count', 0)} 件",
+              f"- サムネイル取得失敗件数: {summary.get('thumbnail_error_count', 0)} 件",
               "",
               "## 2. image-index.csv サンプル5件",
               "",
@@ -290,6 +310,7 @@ jobs:
               "リクエスト件数",
               "Summary fetched_count",
               "サムネイル保存件数",
+              "サムネイル取得失敗件数",
               "## 安全確認",
               "muv/tunnel",
               "muv/food",
