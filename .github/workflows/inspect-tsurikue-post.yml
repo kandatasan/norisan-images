@@ -1,0 +1,72 @@
+name: Inspect tsurikue post
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "requests/inspect-tsurikue-post/*.json"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: inspect-tsurikue-post
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect one request
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+          mapfile -t FILES < <(git diff --name-only "$BEFORE" "$AFTER" -- 'requests/inspect-tsurikue-post/*.json')
+          if [ "${#FILES[@]}" -ne 1 ]; then
+            echo "Exactly one inspect request per commit is required."
+            exit 1
+          fi
+          echo "request=${FILES[0]}" >> "$GITHUB_OUTPUT"
+          STEM=$(basename "${FILES[0]}" .json)
+          echo "stem=${STEM}" >> "$GITHUB_OUTPUT"
+
+      - name: Inspect WordPress post and image metadata
+        env:
+          WP_URL: ${{ secrets.WP_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/inspect_tsuri_post.py
+          mkdir -p reports/inspect-post
+          python3 scripts/inspect_tsuri_post.py \
+            --request "${{ steps.detect.outputs.request }}" \
+            --report "reports/inspect-post/${{ steps.detect.outputs.stem }}.json"
+
+      - name: Record report
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "reports/inspect-post/${{ steps.detect.outputs.stem }}.json"
+          git commit -m "Record tsurikue post inspection: ${{ steps.detect.outputs.stem }}"
+          git push origin HEAD:main
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inspect-tsurikue-post-${{ github.run_id }}
+          path: reports/inspect-post/${{ steps.detect.outputs.stem }}.json
+          if-no-files-found: warn
+          retention-days: 14
