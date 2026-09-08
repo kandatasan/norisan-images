@@ -37,6 +37,9 @@
         "https://tsurikue.com/wp-content/uploads/2026/05/img_1390.jpg",
         "https://tsurikue.com/wp-content/uploads/2026/05/img_1484.jpg"
       ],
+      "placeholder_image_srcs": [
+        "https://tsurikue.com/wp-content/uploads/2026/05/img_1381.jpg"
+      ],
       "image_meta": [
         {
           "id": 617,
@@ -634,7 +637,49 @@
           "source_url": "https://tsurikue.com/wp-content/uploads/2026/05/img_1484.jpg"
         }
       ],
-      "media_search": []
+      "media_search": [],
+      "downloaded_images": [
+        {
+          "url": "https://tsurikue.com/wp-content/uploads/2026/05/img_1376.jpg",
+          "path": "inspect-images/ramen-matsuura/2642/img_1376.jpg",
+          "ok": true
+        },
+        {
+          "url": "https://tsurikue.com/wp-content/uploads/2026/05/img_1379.jpg",
+          "path": "inspect-images/ramen-matsuura/2642/img_1379.jpg",
+          "ok": true
+        },
+        {
+          "url": "https://tsurikue.com/wp-content/uploads/2026/05/img_1382.jpg",
+          "path": "inspect-images/ramen-matsuura/2642/img_1382.jpg",
+          "ok": true
+        },
+        {
+          "url": "https://tsurikue.com/wp-content/uploads/2026/05/img_1388.jpg",
+          "path": "inspect-images/ramen-matsuura/2642/img_1388.jpg",
+          "ok": true
+        },
+        {
+          "url": "https://tsurikue.com/wp-content/uploads/2026/05/img_1389.jpg",
+          "path": "inspect-images/ramen-matsuura/2642/img_1389.jpg",
+          "ok": true
+        },
+        {
+          "url": "https://tsurikue.com/wp-content/uploads/2026/05/img_1390.jpg",
+          "path": "inspect-images/ramen-matsuura/2642/img_1390.jpg",
+          "ok": true
+        },
+        {
+          "url": "https://tsurikue.com/wp-content/uploads/2026/05/img_1484.jpg",
+          "path": "inspect-images/ramen-matsuura/2642/img_1484.jpg",
+          "ok": true
+        },
+        {
+          "url": "https://tsurikue.com/wp-content/uploads/2026/05/img_1381.jpg",
+          "path": "inspect-images/ramen-matsuura/2642/img_1381.jpg",
+          "ok": true
+        }
+      ]
     },
     {
       "id": 1892,
@@ -662,6 +707,9 @@
         "http://tsurikue.com/wp-content/uploads/2026/05/IMG_1381-1024x768.jpeg",
         "https://tsurikue.com/wp-content/uploads/2026/05/IMG_2184-edited-1-scaled.jpeg",
         "https://web.archive.org/web/20230916040417im_/https://i0.wp.com/tsurikue.com/wp-content/uploads/2023/08/img_1339.jpg?resize=1024%2C768&amp;ssl=1"
+      ],
+      "placeholder_image_srcs": [
+        "http://tsurikue.com/wp-content/uploads/2026/05/img_1339.jpg"
       ],
       "image_meta": [
         {
@@ -942,7 +990,29 @@
           "source_url": "https://tsurikue.com/wp-content/uploads/2026/05/IMG_1767-1.jpeg"
         }
       ],
-      "media_search": []
+      "media_search": [],
+      "downloaded_images": [
+        {
+          "url": "http://tsurikue.com/wp-content/uploads/2026/05/IMG_1381-1024x768.jpeg",
+          "path": "inspect-images/ramen-matsuura/1892/IMG_1381-1024x768.jpeg",
+          "ok": true
+        },
+        {
+          "url": "https://tsurikue.com/wp-content/uploads/2026/05/IMG_2184-edited-1-scaled.jpeg",
+          "path": "inspect-images/ramen-matsuura/1892/IMG_2184-edited-1-scaled.jpeg",
+          "ok": true
+        },
+        {
+          "url": "https://web.archive.org/web/20230916040417im_/https://i0.wp.com/tsurikue.com/wp-content/uploads/2023/08/img_1339.jpg?resize=1024%2C768&amp;ssl=1",
+          "ok": false,
+          "error": "HTTP Error 404: NOT FOUND"
+        },
+        {
+          "url": "http://tsurikue.com/wp-content/uploads/2026/05/img_1339.jpg",
+          "path": "inspect-images/ramen-matsuura/1892/img_1339.jpg",
+          "ok": true
+        }
+      ]
     }
   ]
 }
