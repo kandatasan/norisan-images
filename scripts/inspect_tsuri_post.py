@@ -2,6 +2,7 @@
 import argparse, json, os, re, subprocess
 from pathlib import Path
 from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
 
 
 def wp_request(base_url, username, app_password, path):
@@ -39,10 +40,22 @@ def raw_field(post, key):
     return v or ''
 
 
+def download_image(url, out_dir):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    name = Path(urlparse(url).path).name or 'image.jpg'
+    dest = out_dir / name
+    req = Request(url, headers={'User-Agent': 'norisan-images/tsurikue-post-inspector'})
+    with urlopen(req, timeout=30) as resp:
+        data = resp.read()
+    dest.write_bytes(data)
+    return str(dest)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--request', required=True)
     ap.add_argument('--report', required=True)
+    ap.add_argument('--image-dir')
     args = ap.parse_args()
 
     req = json.loads(Path(args.request).read_text(encoding='utf-8'))
@@ -70,7 +83,6 @@ def main():
         if data:
             candidates.extend(data)
 
-    # Exact-ish title hits first, otherwise return search candidates.
     qnorm = re.sub(r'\s+','',query).lower()
     def score(p):
         title = re.sub(r'\s+','',raw_field(p,'title')).lower()
@@ -78,6 +90,8 @@ def main():
     candidates.sort(key=score, reverse=True)
 
     result = {'ok': True, 'query': query, 'host': host, 'candidate_count': len(candidates), 'posts': []}
+    image_dir = Path(args.image_dir) if args.image_dir else None
+
     for post in candidates[:10]:
         content = raw_field(post,'content')
         img_ids = sorted({int(x) for x in re.findall(r'wp-image-(\d+)', content)})
@@ -93,13 +107,33 @@ def main():
                 image_meta.append(m)
             except Exception as exc:
                 image_meta.append({'id': mid, 'error': str(exc)})
-        # Also search media library by query, useful when images are not embedded yet.
+
         media_search = []
         try:
             media_search = wp_request(wp_url,wp_user,wp_password,
                 f'/wp-json/wp/v2/media?context=edit&search={search}&per_page=30&_fields=id,date,slug,link,source_url,alt_text,caption,title,media_details') or []
         except Exception:
             pass
+
+        # Recover obvious placeholder filenames like img_1381.jpg when the image block is missing.
+        placeholder_names = sorted(set(re.findall(r'(img_\d+\.jpe?g)', content, flags=re.I)))
+        inferred = []
+        if srcs:
+            base = srcs[0].rsplit('/',1)[0]
+            for name in placeholder_names:
+                u = base + '/' + name
+                if u not in srcs:
+                    inferred.append(u)
+
+        downloaded = []
+        if image_dir:
+            post_dir = image_dir / str(post.get('id'))
+            for u in srcs + inferred:
+                try:
+                    downloaded.append({'url': u, 'path': download_image(u, post_dir), 'ok': True})
+                except Exception as exc:
+                    downloaded.append({'url': u, 'ok': False, 'error': str(exc)})
+
         result['posts'].append({
             'id': post.get('id'), 'status': post.get('status'), 'slug': post.get('slug'),
             'date': post.get('date'), 'modified': post.get('modified'), 'link': post.get('link'),
@@ -107,7 +141,9 @@ def main():
             'content': content, 'featured_media': post.get('featured_media'),
             'categories': post.get('categories') or [], 'tags': post.get('tags') or [],
             'embedded_image_ids': img_ids, 'embedded_image_srcs': srcs,
+            'placeholder_image_srcs': inferred,
             'image_meta': image_meta, 'media_search': media_search,
+            'downloaded_images': downloaded,
         })
 
     Path(args.report).parent.mkdir(parents=True, exist_ok=True)
