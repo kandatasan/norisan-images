@@ -86,6 +86,14 @@ def main():
     if len(content.strip()) < 1000:
         raise SystemExit("Draft content is suspiciously short")
 
+    categories = req.get("categories")
+    if categories is not None:
+        if not isinstance(categories, list) or not categories or not all(isinstance(v, int) and v > 0 for v in categories):
+            raise SystemExit("categories must be a non-empty list of positive integer IDs")
+    featured_media = req.get("featured_media")
+    if featured_media is not None and (not isinstance(featured_media, int) or featured_media < 0):
+        raise SystemExit("featured_media must be a non-negative integer ID")
+
     wp_url = os.environ.get("WP_URL", "").strip()
     wp_user = os.environ.get("WP_USER", "").strip()
     wp_password = os.environ.get("WP_APP_PASSWORD", "").strip()
@@ -96,7 +104,7 @@ def main():
     try:
         validate_site(wp_url)
         encoded_slug = parse.quote(slug, safe="")
-        fields = parse.quote("id,slug,status,title,content,link", safe=",")
+        fields = parse.quote("id,slug,status,title,content,link,categories,featured_media", safe=",")
 
         existing = None
         for existing_status in ("draft", "pending", "future", "private", "publish"):
@@ -113,12 +121,20 @@ def main():
         excerpt = str(req.get("excerpt") or "").strip()
         if excerpt:
             payload["excerpt"] = excerpt
+        if categories is not None:
+            payload["categories"] = categories
+        if featured_media is not None:
+            payload["featured_media"] = featured_media
 
         if existing:
             post_id = int(existing["id"])
             if existing.get("status") != "draft":
                 raise RuntimeError(f"Slug already exists with status={existing.get('status')} and post_id={post_id}")
-            if extract_raw(existing, "title") == title and extract_raw(existing, "content") == content:
+            metadata_matches = (
+                (categories is None or existing.get("categories") == categories)
+                and (featured_media is None or existing.get("featured_media") == featured_media)
+            )
+            if extract_raw(existing, "title") == title and extract_raw(existing, "content") == content and metadata_matches:
                 report.update({"ok": True, "post_id": post_id, "link": existing.get("link"), "message": "Matching draft already exists; no duplicate created."})
             else:
                 wp_request(wp_url, wp_user, wp_password, f"/wp-json/wp/v2/posts/{post_id}?context=edit", method="POST", payload=payload)
@@ -135,10 +151,19 @@ def main():
             and verify.get("slug") == slug
             and extract_raw(verify, "title") == title
             and extract_raw(verify, "content") == content
+            and (categories is None or verify.get("categories") == categories)
+            and (featured_media is None or verify.get("featured_media") == featured_media)
         )
         if not ok:
             raise RuntimeError("Draft verification failed")
-        report.update({"ok": True, "verify_status": verify.get("status"), "verify_slug": verify.get("slug"), "link": verify.get("link")})
+        report.update({
+            "ok": True,
+            "verify_status": verify.get("status"),
+            "verify_slug": verify.get("slug"),
+            "verify_categories": verify.get("categories"),
+            "verify_featured_media": verify.get("featured_media"),
+            "link": verify.get("link"),
+        })
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
     except Exception as exc:
