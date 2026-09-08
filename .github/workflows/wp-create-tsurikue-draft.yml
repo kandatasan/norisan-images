@@ -1,0 +1,81 @@
+name: WordPress create tsurikue draft
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "requests/create-draft/*.json"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wordpress-create-tsurikue-draft
+  cancel-in-progress: false
+
+jobs:
+  create-draft:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect one draft request
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+          mapfile -t FILES < <(git diff --name-only "$BEFORE" "$AFTER" -- 'requests/create-draft/*.json')
+          if [ "${#FILES[@]}" -ne 1 ]; then
+            printf 'Changed draft requests:\n%s\n' "${FILES[*]:-none}"
+            echo "Exactly one create-draft request per commit is required."
+            exit 1
+          fi
+          echo "request=${FILES[0]}" >> "$GITHUB_OUTPUT"
+          SLUG=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["slug"])' "${FILES[0]}")
+          echo "slug=${SLUG}" >> "$GITHUB_OUTPUT"
+
+      - name: Create and verify WordPress draft
+        env:
+          WP_URL: ${{ secrets.WP_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/create_tsurikue_wp_draft.py
+          mkdir -p reports
+          python3 scripts/create_tsurikue_wp_draft.py \
+            --request "${{ steps.detect.outputs.request }}" \
+            --report "reports/create-tsurikue-draft.json"
+          cat reports/create-tsurikue-draft.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record successful result
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports/draft-results
+          cp reports/create-tsurikue-draft.json "reports/draft-results/${{ steps.detect.outputs.slug }}.json"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "reports/draft-results/${{ steps.detect.outputs.slug }}.json"
+          if git diff --cached --quiet; then
+            echo "No result change to commit."
+          else
+            git commit -m "Record tsurikue draft result: ${{ steps.detect.outputs.slug }}"
+            git push origin HEAD:main
+          fi
+
+      - name: Upload draft report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wp-create-tsurikue-draft-${{ github.run_id }}
+          path: reports/create-tsurikue-draft.json
+          if-no-files-found: warn
+          retention-days: 14
