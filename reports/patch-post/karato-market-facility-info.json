@@ -1,0 +1,15 @@
+{
+  "ok": true,
+  "slug": "karato-market",
+  "marker": "<!-- tsurikue:facility-info:karato-market:v1 -->",
+  "mode": "append",
+  "post_id": 3633,
+  "link": "https://tsurikue.com/karato-market/",
+  "status_before": "publish",
+  "changed": true,
+  "message": "Block appended to current published post content.",
+  "verify_status": "publish",
+  "verify_slug": "karato-market",
+  "verify_modified": "2026-09-09T18:37:18",
+  "verify_marker": true
+}
