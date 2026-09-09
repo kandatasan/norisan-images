@@ -1,0 +1,78 @@
+name: Patch tsurikue published post
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "requests/patch-tsurikue-post/*.json"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: patch-tsurikue-post
+  cancel-in-progress: false
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect one request
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.sha }}"
+          mapfile -t FILES < <(git diff --name-only "$BEFORE" "$AFTER" -- 'requests/patch-tsurikue-post/*.json')
+          if [ "${#FILES[@]}" -ne 1 ]; then
+            echo "Exactly one patch request per commit is required."
+            exit 1
+          fi
+          echo "request=${FILES[0]}" >> "$GITHUB_OUTPUT"
+          STEM=$(basename "${FILES[0]}" .json)
+          echo "stem=${STEM}" >> "$GITHUB_OUTPUT"
+
+      - name: Patch current published WordPress post
+        env:
+          WP_URL: ${{ secrets.WP_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/patch_tsurikue_wp_post.py
+          mkdir -p reports/patch-post
+          python3 scripts/patch_tsurikue_wp_post.py \
+            --request "${{ steps.detect.outputs.request }}" \
+            --report "reports/patch-post/${{ steps.detect.outputs.stem }}.json"
+
+      - name: Record report
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPORT="reports/patch-post/${{ steps.detect.outputs.stem }}.json"
+          if [ -f "$REPORT" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add "$REPORT"
+            if ! git diff --cached --quiet; then
+              git commit -m "Record tsurikue post patch: ${{ steps.detect.outputs.stem }}"
+              git push origin HEAD:main
+            fi
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-tsurikue-post-${{ github.run_id }}
+          path: reports/patch-post/${{ steps.detect.outputs.stem }}.json
+          if-no-files-found: warn
+          retention-days: 14
