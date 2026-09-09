@@ -1,0 +1,7 @@
+{
+  "slug": "karato-market",
+  "marker": "<!-- tsurikue:facility-info:karato-market:v1 -->",
+  "block_path": "blocks/karato-market-facility-info.html",
+  "mode": "append",
+  "expected_status": "publish"
+}
